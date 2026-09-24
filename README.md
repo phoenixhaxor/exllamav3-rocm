@@ -245,17 +245,63 @@ produces the same text as plain decoding for the DFlash2 path in these tests.
 - HIP attention kernels cover causal full attention without softcap or sinks, head dim 128/256,
   q_len up to 16 (WMMA verification up to 8, 8-bit cache); other shapes use the Triton kernels.
 - Quantization (conversion) kernels compile but are untested on ROCm.
-- The 8-row matmul (codebook decode + FMA) is ~78% of GPU time per speculative round. About 16-18% of
-  each round is GPU idle time: ~3 us per kernel boundary (graph or eager alike) and the host-side
-  turnaround after each verification. HIP graphs save little on ROCm: `hipGraphLaunch` costs CPU time
-  per node like eager launches, and each graph launch adds ~8 us of GPU idle. Replacing the per-module
-  graphs with eager launches (`EXL3_NOGRAPH=mlp,gdn`) is ~0.5% faster; merging attention + MLP graphs
-  per layer would save at most ~0.5 ms per ~41 ms round, so it was not done. Runtime knobs (`HIP_FORCE_DEV_KERNARG`, `HSA_ENABLE_INTERRUPT`,
-  `GPU_MAX_HW_QUEUES`) do not change the ~3.3 us per-kernel dispatch cost on this setup.
-- Tried and dropped (measured, no gain): persistent/work-queue matmul scheduling, larger or smaller x
-  chunks in LDS, 2 tiles per wave, split accumulators, prefetching the DeltaNet inputs, replaying the
-  DeltaNet state on rollback instead of storing per-token history (the recurrence is latency-bound,
-  the replay cost more than the saved writes), GPU-side embedding gather (the CPU lookup is ~0.1 ms).
+
+## Performance analysis and open ideas
+
+### Where the time goes
+
+One DFlash2 speculative round (draft forward + 8-token verification) takes ~39 ms on the 7900 XTX
+(measured with `rocm_tests/gaps.py`, 60 rounds, short context):
+
+| Part | Time per round | Notes |
+|---|---|---|
+| EXL3 matmuls | ~26 ms | 8 rows (verification) and the draft; VALU- and latency-bound (see below) |
+| Gated DeltaNet recurrence | ~1.7 ms | 48 layers; latency-bound, plus per-token history writes for rollback |
+| Attention, norms, other kernels | ~5 ms | |
+| GPU idle | ~6 ms (16%) | ~984 kernel launches x ~3.3 us dispatch gap, plus host turnaround after the verification sync |
+
+The 8-row matmul costs ~1.4x a 1-row matmul. The `mul1` codebook decode (a hash plus byte sum per
+weight, ~5 VALU ops) and the 8-row FMA (`v_dot2`, dual-issued) share one issue port, and the loop is
+also latency-bound (~54% VALU utilization). Decoding costs the same per weight at any bitrate, so a
+3.0 bpw model is not faster than 3.5 bpw. A 4-row matmul is ~20% cheaper than an 8-row one, but
+shortening the verified block (dynamic draft length) lost more in accepted tokens than it saved.
+
+HIP graphs save little on ROCm: `hipGraphLaunch` spends CPU time per node like eager launches, and
+each graph launch adds ~8 us of GPU idle. Replacing the per-module graphs with eager launches
+(`EXL3_NOGRAPH=mlp,gdn`) is ~0.5% faster. Runtime knobs (`HIP_FORCE_DEV_KERNARG`,
+`HSA_ENABLE_INTERRUPT`, `GPU_MAX_HW_QUEUES`) do not change the ~3.3 us per-kernel dispatch cost.
+
+### Tried and dropped (measured, no gain)
+
+| Idea | Result |
+|---|---|
+| WMMA for the matmul FMA | half of the 16 rows wasted at 8 rows; slower than dual-issued `v_dot2` |
+| Hadamard input transform inside the matmul | redundant per block, ~13% more VALU work at 8 rows |
+| Persistent / work-queue matmul scheduling | no gain once clocks are warm; block-time spread is contention, not imbalance |
+| Smaller or larger x chunks in LDS (more waves) | no gain or slower |
+| 2 tiles per wave, split accumulators | slower / no gain |
+| Merging attention + MLP graphs per layer | at most ~0.5 ms per round; eager MLP/DeltaNet gets the same |
+| Prefetching the DeltaNet inputs into registers | slower (loads were already overlapped) |
+| DeltaNet rollback by replay instead of per-token history | the replay kernel cost more than the saved writes (the recurrence is latency-bound); also needs per-layer copies of the inputs, which share scratch buffers across layers |
+| GPU-side embedding gather from pinned host memory | the CPU lookup is only ~0.1 ms per round |
+| 3.0 bpw main model | not faster (decode cost is per weight) and lower quality |
+| Dynamic draft length, hot-token (vocabulary-pruned) draft head | slower end-to-end |
+
+### Open ideas (not done)
+
+Estimated gains are per speculative round (~39 ms); each is small, which is why they were left out.
+
+| Idea | Estimated gain | Notes |
+|---|---|---|
+| Host turnaround after the verification sync | up to ~1 ms (~2.5%) | keep draft tokens on the GPU, build the next batch while the GPU is busy, avoid the pinned D2H copy before verification; requires restructuring the generator loop |
+| Per-layer "megakernel" (persistent kernel running a whole block) | up to ~3 ms (dispatch gaps) | large effort; needs grid-wide barriers between dependent stages |
+| Parallelize the RMSNorm input-transform tail | ~0.3 ms | `rms_norm_had` runs one block per row (8 blocks at 8 rows) and got ~2 us slower per call |
+| Fold `gated_delta_net_fused_op_3` into the conv / recurrence kernels | ~0.15 ms (-48 kernels) | compute beta / g in the recurrence, read the fp32 qkv directly in the conv update |
+| Attention: fuse RoPE + paged KV update + q/g deinterleave | ~0.1-0.15 ms (-32..48 kernels) | 16 attention layers |
+| RMSNorm input-transform hand-off for the attention qkv bundle | ~0.05 ms | the attention graph is still captured; the graph would need a variant without its input kernel |
+| Cheaper draft lm_head | up to ~1.3 ms | DFlash2 runs the full 6-bit lm_head (950 MB) over all 8 block rows every round; a pruned head lost acceptance, a dedicated small head would need training |
+| DeltaNet history in 16-bit | ~0.4 ms | halves the rollback-history writes; risks accuracy of the carried state |
+| MoE models: routed multi-matrix matmul on RDNA3 | functionality | expert routing (indices / weights) is not ported; MoE models fall back to the upstream path |
 
 ## Notes on published RTX 3090 / Arc B70 numbers
 

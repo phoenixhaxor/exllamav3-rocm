@@ -1,0 +1,24 @@
+diff --git a/common/hardware.py b/common/hardware.py
+index e6bec44..f263e0c 100644
+--- a/common/hardware.py
++++ b/common/hardware.py
+@@ -9,11 +9,18 @@ def hardware_supports_exllamav3(gpu_device_list: list[int]):
+     and doesn't support ROCm.
+     """
+ 
++    # ROCm: RDNA3 (gfx11) runs through the exllamav3 HIP port (exl3_rdna3 kernels)
++    if torch.version.hip:
++        return all(
++            torch.cuda.get_device_properties(d).gcnArchName.startswith("gfx11")
++            for d in gpu_device_list
++        )
++
+     min_compute_capability = min(
+         torch.cuda.get_device_capability(device=device_idx)[0] for device_idx in gpu_device_list
+     )
+ 
+-    if torch.version.hip or min_compute_capability < 8:
++    if min_compute_capability < 8:
+         return False
+     else:
+         return True

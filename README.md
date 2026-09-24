@@ -1,307 +1,226 @@
+# exllamav3 on AMD RDNA3 (ROCm port)
 
-<p align="center">
-  <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
-</p>
+A ROCm/HIP port of [exllamav3](https://github.com/turboderp-org/exllamav3) for RDNA3 GPUs (tested on a
+Radeon RX 7900 XTX, gfx1100), with RDNA3-specific kernels for the EXL3 matmul and for decode attention.
+It runs Qwen3.8-27B EXL3 with **DFlash2** or **MTP** speculative decoding, **vision**, reasoning and an
+**8-bit KV cache at 192K-256K context** on a single 24 GB card, served through a lightly patched
+[TabbyAPI](https://github.com/theroyallab/tabbyAPI).
 
-[Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
+Upstream exllamav3 is CUDA-only: its EXL3 kernels are built on `mma.sync`, `ldmatrix`, `cp.async` and
+cooperative launches, and TabbyAPI refuses AMD GPUs. This fork keeps the upstream Python stack and model
+format unchanged and replaces the pieces that do not map to RDNA3.
 
-ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
+The original upstream README is kept as [README.exllamav3.md](README.exllamav3.md).
 
-- **Quantization** - [EXL3](doc/exl3.md), based on QTIP, plus 2–8 bit cache quantization.
-- **Parallel inference** - Flexible tensor-parallel and expert-parallel inference for consumer hardware setups.
-- **CPU offloading** - Allows large MoE models to run with limited GPU resources. AVX2 and AVX512 support.  
-- **Generation** - Continuous, dynamic batching, speculative decoding, multimodal support.
-- **Integrations** - Broad [HF model support](#architecture-support), a [Transformers plugin](examples/transformers_integration.py), and an OpenAI-compatible API via [TabbyAPI](https://github.com/theroyallab/tabbyAPI/).
+---
 
-> [!TIP]
-> **Looking for a server?** [TabbyAPI](https://github.com/theroyallab/tabbyAPI/) is the official and recommended backend server. It provides an OpenAI-compatible API for local or remote inference, HF model downloading, embedding model support, and HF Jinja2 chat templates. Its startup script manages and installs prerequisites to help you get started.
+## Results (RX 7900 XTX 24 GB, ROCm 7.2.4, PyTorch 2.13.0+rocm7.2)
 
-<p align="center">
-  <img src="doc/qb_kld.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
-</p>
+Decode speed, greedy, code-style prompt, 8-bit KV cache (DFlash2 draft KV 4-bit), measured with
+`rocm_tests/bench_long.py` after a prompt of the given length:
 
-## Installation
+| Context | DFlash2 (default) | MTP | No draft |
+|---|---|---|---|
+| 2K | 97-115 tok/s | 87 tok/s | 38.5 tok/s |
+| 32K | **117 tok/s** | 79 tok/s | 36.3 tok/s |
+| 99K | **84 tok/s** | 58 tok/s | - |
 
-Start by making sure you have the appropriate version of [PyTorch](https://pytorch.org/get-started/locally/) installed (CUDA 12.4 or later) since the Torch dependency is not automatically handled by `pip`. Then pick a method below:
+Short prompts, 400 generated tokens, greedy (`rocm_tests/bench_gen.py`):
 
-### Prebuilt wheel · recommended
+| Workload | DFlash2 | MTP (3 draft tokens) |
+|---|---|---|
+| Code | 115 tok/s | 88 tok/s |
+| Explanation | 81 tok/s | 67 tok/s |
+| Prose / story | 62 tok/s | 62 tok/s |
 
-Pick a wheel from the [releases page](https://github.com/turboderp-org/exllamav3/releases), then e.g.:
+Through the TabbyAPI OpenAI endpoint (temperature 0.6): code 108-119 tok/s, prose 57-61 tok/s.
 
-```sh
-pip install https://github.com/turboderp-org/exllamav3/releases/download/v0.0.6/exllamav3-0.0.6+cu128.torch2.8.0-cp313-cp313-linux_x86_64.whl
+Prompt processing (prefill): ~1170 tok/s at 32K, ~1090 tok/s at 64K, ~940 tok/s at 99K. Long-context
+retrieval (needle in a haystack through the API): 184,656-token prompt with the DFlash2 / 192K profile
+and 247,056-token prompt with the MTP / 256K profile, both answered correctly.
+
+For reference, the same GPU with llama.cpp (Qwen3.8-27B IQ3_XXS GGUF + DFlash2 Q8 draft) decoded at
+40-53 tok/s.
+
+Speculative decoding speed depends on the text: drafts are accepted far more often on code than on free
+prose. All numbers are single-stream (batch size 1).
+
+## Models
+
+| Role | Repository | Size | Contents |
+|---|---|---|---|
+| Main | [Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw](https://huggingface.co/Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw) | 15.3 GB | Qwen3.8-27B, EXL3 3.5 bpw (module-adaptive), `mul1` codebook |
+| Draft | [Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw](https://huggingface.co/Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw) | 1.47 GB | DFlash2 block-diffusion drafter, EXL3 5.0 bpw |
+
+Main model details (read from the checkpoint):
+
+- 64 layers: 48 Gated DeltaNet (linear attention) + 16 full attention (24 q heads, 4 kv heads, head dim 256).
+- Per-module bitrates: MLP 3-bit (most layers) or 4-bit, attention / DeltaNet projections 4-bit, one
+  5-bit `o_proj`, `lm_head` 6-bit; embeddings bf16 (kept in system RAM by exllamav3).
+- **Built-in MTP head** (4-bit), used by `draft_mode: mtp`.
+- **Vision tower included** (27 blocks, bf16, 0.78 GB). The model card says "no vision tower", but the
+  weights are in the checkpoint and work.
+
+DFlash2 draft: 5 sliding-window (2048) layers conditioned on target hidden states, drafts 7 tokens per
+round (verification batch of 8).
+
+Download:
+
+```bash
+rocm/scripts/download_models.sh models
 ```
 
-### Install from PyPI
+## Serving profiles
 
-```sh
-pip install exllamav3
-```
-Note that the PyPI package does not contain a prebuilt extension and requires the CUDA toolkit and build prerequisites (i.e. VS Build Tools on Windows, gcc on Linux, `python-dev` headers etc.).
+| Profile | File | Draft | Context | KV cache | VRAM (idle) |
+|---|---|---|---|---|---|
+| Default, fastest | `rocm/tabbyapi/config.dflash2-192k.yml` | DFlash2 | 196,608 | Q8 (draft Q4) | ~23.6 GB |
+| Full context | `rocm/tabbyapi/config.mtp-256k.yml` | MTP | 262,144 | Q8 | ~23.5 GB |
 
-### Build from source
+Measured VRAM per component (8-bit KV):
 
-<details>
-<summary>Source installation with uv or pip</summary>
+| Component | 8K ctx | 128K ctx | 192K ctx |
+|---|---|---|---|
+| Main model + cache + recurrent state | 12.45 GB | 16.43 GB | 18.56 GB |
+| DFlash2 draft + cache (Q8 / Q4) | 1.55 GB | 2.80 GB | 3.46 / 2.52 GB |
+| Vision tower | 0.78 GB | 0.78 GB | offloaded to RAM |
 
+Main KV cost is ~33.9 KB per token at Q8 (16 attention layers x 4 kv heads x 256). DFlash2 with a 256K
+context does not fit in 24 GB (the draft cache is allocated for the full context although the draft only
+attends to the last 2048 tokens); use the MTP profile for 256K.
 
-`exllamav3` declares a minimum `torch` version (>= 2.6.0) and CUDA version (>= 12.4), but beyond that the user is free to select a version of `torch` that is compatible with their environment.
+The draft KV cache at Q4 gives the same acceptance as FP16 in greedy tests, so the default profile keeps
+the main cache at Q8 and quantizes only the draft cache further.
 
-`torch` can be installed in three ways (from least to most effort):
-1. **with `uv`, setting only `--extra cuXXX`** installs `torch` automatically with the specified CUDA version, `torch` version is selected by `uv` from compatible versions in the specific index associated with the chosen CUDA version (options 1 and 2)
-2. **with `uv`, creating a thin project that depends on `exllamav3[cuXXX]` and pins a specific `torch` version** — like (1) but `torch` is pinned in the thin project's `pyproject.toml`, see [pinning a specific PyTorch version (optional)](#pinning-a-specific-pytorch-version-optional) for details
-3. Manually with `uv pip` or `pip` (options 3 and 4)
+## Quick start
 
-The flavor extras (`--extra`) are `cu124`, `cu126`, `cu128`, `cu129`, `cu130`, and `cu132` — pick the one matching your installed CUDA build. Both `uv sync` and `pip install .` build the package in an isolated environment where your `torch` is not visible, so they install the extension sources and compile them at first import (JIT, a few minutes once per torch version). For a precompiled install run `pip install --no-build-isolation .` in an environment that already has `torch`, or use the release wheels. Selecting a flavor installs the matching CUDA build of `torch`.
+Requirements: Linux, ROCm 7.x (tested 7.2.4) with an RDNA3 GPU, ~20 GB disk for models, 32 GB+ RAM.
 
-**Option 1 — Working in the cloned repo directly (`uv sync`):**
+```bash
+git clone <this repository> exllamav3-rocm && cd exllamav3-rocm
 
-```sh
-git clone https://github.com/turboderp-org/exllamav3
-cd exllamav3
-# (Optional) switch to dev branch for latest in-progress features
-git checkout dev
+rocm/scripts/setup_env.sh .venv-rocm          # Python 3.12 + torch 2.13.0 (ROCm 7.2 wheels) + deps
+source .venv-rocm/bin/activate                 # or: conda activate ./.venv-rocm
+ROCM_HOME=/opt/rocm rocm/scripts/build.sh      # builds exllamav3_ext for gfx1100 (~10 min)
 
-uv venv
-uv sync --extra cu130
-# add --extra examples and/or --extra eval for those extra dependencies
-```
-
-**Option 2 — Using `exllamav3` as a dependency from another project (`uv add`):**
-
-```sh
-# `uv add` works inside an existing project (a directory with a pyproject.toml).
-# `uv init` creates one if you're starting a new project, if integrating into
-# an existing project skip `uv init`.
-uv init my-project
-cd my-project
-
-# local checkout
-uv add 'path/to/exllamav3[cu130]'               # non-editable
-uv add 'path/to/exllamav3[cu130]' --editable    # editable
-
-# straight from GitHub
-uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]'                 # default branch
-uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]' --branch dev    # specific branch
+rocm/scripts/download_models.sh models
+rocm/scripts/install_tabbyapi.sh ../tabbyAPI models
+rocm/scripts/run_tabbyapi.sh config.yml ../tabbyAPI
 ```
 
-**Option 3 — Bring your own `torch` and let `uv` pick the backend automatically:**
+The server listens on port 8096 (OpenAI-compatible `/v1/chat/completions`, streaming, tools, images).
+Authentication is enabled in the shipped configs: TabbyAPI writes the keys to `api_tokens.yml` on first
+start. Set `disable_auth: true` only if the port is not reachable from untrusted machines.
 
-```sh
-uv venv            # or: uv venv --python-preference only-managed
-source .venv/bin/activate
-uv pip install torch --torch-backend=auto
-uv pip install .
+Full-context profile:
+
+```bash
+cp rocm/tabbyapi/config.mtp-256k.yml ../tabbyAPI/
+rocm/scripts/run_tabbyapi.sh config.mtp-256k.yml ../tabbyAPI
 ```
 
-`--torch-backend=auto` inspects your system and installs the matching PyTorch CUDA build; see [Automatic backend selection](https://docs.astral.sh/uv/guides/integration/pytorch/#automatic-backend-selection).
+Without TabbyAPI (Python API), see `rocm_tests/bench_gen.py`: load `Model.from_config(config)` for the
+main model, `Model.from_config(config, component = "mtp")` or the DFlash2 directory for the draft,
+`Model.from_config(config, component = "vision")` for images, and create the main `Cache` with
+`max_history` equal to the draft length (the DeltaNet layers keep one state per drafted position).
 
-**Option 4 — With `pip`:**
+## What changed (vs. upstream exllamav3)
 
-On Windows, you also need the `triton-windows` package (declared as a dependency in `pyproject.toml`); the attention, cache and recurrent kernels are Triton and ExLlamaV3 does not import without it.
+### EXL3 matmul for small batches: `quant/exl3_rdna3*.cu`
 
-```sh
-# install a CUDA-enabled torch first so it matches your setup, e.g.:
-pip install torch --index-url https://download.pytorch.org/whl/cu128
-pip install .
-```
+Used for every EXL3 linear with up to 144 rows (decode, draft verification, MTP), replacing the NVIDIA
+GEMV/GEMM kernels:
 
-</details>
+- Input transform (sign flips + 128-point Hadamard) runs once per matmul in a small kernel that writes
+  the activations in the main kernel's LDS layout.
+- One wave per 16x16 weight tile column, k-split across blocks, split-K reduction by the last block to
+  arrive (atomic counter), output Hadamard in the epilogue. A single graph-patchable launch pair.
+- Trellis words stream through a register prefetch ring built on `raw_buffer_load` and pinned with
+  `sched_barrier` (plain loads get folded into load-at-use by InstCombine, which serializes the stream).
+- `mul1` codebook decode tuned for RDNA3 instruction rates: two 24-bit multiplies instead of the
+  1/5-rate `v_mul_lo_u32`, `v_sad_u8` byte sums instead of the half-rate `v_dot4`, `v_alignbit`
+  window extraction; the codebook's affine map is folded into the epilogue so weights enter
+  `v_dot2_f32_f16` raw.
+- Instantiated for 1-8 bit (and x.5 with `mul1`), rows per pass 1/2/3/4/5/6/8/12/16.
 
-<details>
-<summary>Pinning a specific PyTorch version (optional)</summary>
+Achieved bandwidth on 4-bit tensors: ~700-770 GB/s at 1 row, ~450-530 GB/s at 8 rows (VALU-bound).
 
-#### Pinning a specific PyTorch version (optional)
+### Decode and verification attention: `rdna3_attn.cu`
 
-The flavor extra picks the *index*, but by default torch resolves to the latest version on that
-index that satisfies `>=2.6.0`. To pin a specific torch version while developing on `exllamav3`,
-create a **"thin" project** that consumes your local checkout as an editable install and declares
-the exact `torch` version itself. This keeps the pin out of the `exllamav3` pyproject, so
-you can change the torch version freely without touching the repo.
+Drop-in replacements for the Triton flash-decoding split kernel on the graphed decode path (same
+arguments, same partial layout, the Triton combine kernel is reused), for 8-bit and FP16 caches:
 
-```
-my-exllamav3-dev/          # thin project (uv init)
-├── pyproject.toml
-└── src/                  # package sources (auto-generated)
-```
+- `q_len == 1`: lane-per-token scores with `v_dot2`, online softmax, lane-per-dimension values.
+- `q_len 2..8` (draft verification, 8-bit cache): `v_wmma_f32_16x16x16_f16` for both Q·K^T and P·V,
+  K/V tiles staged in LDS once per kv head (V transposed so a WMMA B fragment is contiguous), register
+  prefetch of the next tile.
 
-In `pyproject.toml`:
+At 32K context this took decode attention from ~10 ms to ~2.7 ms per token; at 100K the DFlash2
+verification from ~45 ms to ~14 ms per round.
 
-```toml
-[project]
-name = "my-exllamav3-dev"
-version = "0.1.0"
-description = "Dev environment for exllamav3"
-requires-python = ">=3.10.11"
-dependencies = [
-    "exllamav3[cu130]",   # select correct CUDA version
-    "torch==2.13.0",      # pin the exact torch version you need
-]
+### Other changes
 
-[tool.uv.sources]
-exllamav3 = { path = "../exllamav3", editable = true }
-```
+- HIP compatibility across the extension: 64-bit warp masks, `dp4a` / `lop3` / atomics / cache-hinted
+  load shims, `__nanosleep`, `__grid_constant__`, driver-API graph calls, Triton `hsaco` loading.
+- `hgemm`: rocBLAS on gfx11 has no WMMA solution for fp16 x fp16 -> fp32 output (~16 vs ~80 TFLOPS),
+  so fp32-output products of 64+ rows run as fp16 output plus a widening copy (prefill 2.3x faster).
+- Triton paged prefill: 128x64 tiles, one stage on HIP for head dim 256 (~23 -> ~57 TFLOPS).
+- Triton decode split kernel: skips keys before the sliding window (the DFlash2 draft scanned the whole
+  context: 13 ms -> 1.2 ms per round at 100K).
+- `gdn_ba_gemv`: 16-byte loads and `v_dot2` with independent accumulators.
+- Fused multi-matrix `mgemm` bundling is disabled on HIP (`use_mgemm` returns False); projections run as
+  separate RDNA3 matmuls.
 
-Adjust `../exllamav3` to point at your local checkout, then a plain `uv sync` sets up an
-environment with the correct PyTorch index (routed via the `cuXXX` extra),
-the pinned version of `torch` from that index (as long as it exists), and an editable install of `exllamav3` so code
-changes apply immediately. Switch CUDA flavors by changing the extra (`exllamav3[cu124]`,
-`exllamav3[cu128]`, …) and/or the torch pin in the thin project.
+## Environment switches
 
-Or, if you're installing torch manually with `uv pip install torch` (e.g. as in Option 3 above),
-specify the version directly, e.g. `uv pip install "torch==2.11.0" --torch-backend=auto`.
+| Variable | Default | Effect |
+|---|---|---|
+| `EXL3_RDNA3_GEMM` | 1 | 0 = fall back to the (emulated) upstream EXL3 kernels |
+| `EXL3_RDNA3_ATTN` | 1 | 0 = Triton decode attention |
+| `EXL3_RDNA3_ATTN_SPLIT_MULT` | 16 | kv splits per CU for the HIP attention kernels (cap 128) |
+| `EXL3_RDNA3_TARGET_BLOCKS` | 4 x CUs | grid size target for the EXL3 matmul k-split |
+| `EXL3_HIP_MGEMM` | 0 | 1 = allow the fused multi-matrix paths (not ported) |
+| `EXL3_PF_BLOCK_M`, `EXL3_PF_BLOCK_N`, `EXL3_PF_WARPS` | - | Triton prefill tile overrides |
 
-</details>
+## Tests and benchmarks (`rocm_tests/`)
 
-After installing with one of the options above, you should be able to run the conversion, eval and 
-example scripts from the main repo directory, e.g., `uv run python convert.py -i ...` or, for manual
-installations once the venv is active, `python convert.py -i ...`
+| Script | Purpose |
+|---|---|
+| `test_rdna3_gemm.py <model_dir> [tensor ...]` | EXL3 matmul vs. reconstructed weights (m = 1..144, fp16/fp32 out) and an independent numpy trellis decoder |
+| `bench_gen.py -m <model> [-dm <draft> \| --mtp]` | short-prompt generation speed, draft acceptance, `--image` for vision |
+| `bench_long.py 2000,32000,99000 [-dm <draft> \| --mtp]` | decode speed after long prompts (greedy, prints output with `--show`) |
+| `prof_gen.py`, `prof_long.py`, `prof_prefill.py` | kernel-time breakdowns (torch.profiler) |
+| `kbench.cc` | standalone EXL3 matmul timing harness (`hipcc -x hip`) |
+| `attn_pf_bench.py` | prefill attention microbenchmark with a torch reference |
+| `api_test.py <url> <image>`, `needle_api.py <n> <depth>` | OpenAI API smoke test, long-context retrieval |
+| `vram.py <ctx> <kv_bits> <draft_kv_bits>` | VRAM per component |
 
-**Build environment variables**
+Model paths default to `models/...` or `EXL3_MODEL_DIR` / `EXL3_DRAFT_DIR`. Greedy speculative decoding
+produces the same text as plain decoding for the DFlash2 path in these tests.
 
-- `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for 
-compilation. Set this to a reasonable value like 4 in that case.
-- `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch
-will build/load it at runtime instead.
+## Limitations
 
-## Examples
+- Tested on gfx1100 only. The kernels assume wave32 (RDNA3); RDNA2 lacks the dot/WMMA instructions used,
+  CDNA (wave64) is not supported.
+- Tested models use the `mul1` codebook with integer bitrates; the half-integer (x.5 bpw) and
+  `mcg` / 3INST codebook paths compile but are not validated.
+- MoE / block-sparse models: the fused expert kernels are not ported (graph parameter patching for
+  per-expert weights is not supported by the RDNA3 matmul).
+- HIP attention kernels cover causal full attention without softcap or sinks, head dim 128/256,
+  q_len up to 16 (WMMA verification up to 8, 8-bit cache); other shapes use the Triton kernels.
+- Quantization (conversion) kernels compile but are untested on ROCm.
+- The 8-row matmul is VALU-bound (codebook decode + FMA); it is the largest remaining cost per
+  speculative round.
 
-A number of example scripts are provided to showcase the features of the backend and generator. 
-For instance, a versatile CLI chatbot:
+## Notes on published RTX 3090 / Arc B70 numbers
 
-<p align="center">
-  <img src="doc/chatpy.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
-</p>
+The ~144 tok/s Qwen3.8-27B figure on an RTX 3090 comes from SGLang with the `sglang-exl3` plugin and
+NEXTN (MTP) drafting on the 3.0 bpw quant (prose ~99, code ~143 tok/s), not from exllamav3 + DFlash2;
+TabbyAPI/exllamav3 runs in the same registry reach 58-69 tok/s on a 3090. The Arc B70 figure of 60 tok/s
+is single-stream at 4 bpw (330 tok/s is the 16-stream aggregate).
 
-```sh
-python examples/chat.py -m <input_dir> -mode <prompt_mode>
+## License and credits
 
-# Wealth of options
-python examples/chat.py -h
-```
-
-## Architecture support
-
-| Model family                                     | HF architecture | Multimodal | Notes |
-|--------------------------------------------------| --- | :---: | --- |
-| **AFM**                                          | `ArceeForCausalLM` |  |  |
-| **AfMoE**                                        | `AfmoeForCausalLM` |  |  |
-| **Apertus**                                      | `ApertursForCausalLM` |  |  |
-| **Command-R** etc.                               | `CohereForCausalLM` |  |  |
-| **Command-A**, **Command-R+** etc.               | `Cohere2ForCausalLM` |  |  |
-| **DeciLM**, **Nemotron**                         | `DeciLMForCausalLM` |  |  |
-| **Deepseek V3**                                  | `DeepseekV3ForCausalLM` |  |  |
-| **Deepseek V4**                                  | `DeepseekV4ForCausalLM` | ✓ |  |
-| **dots.llm1**                                    | `Dots1ForCausalLM` |  | |
-| **ERNIE 4.5**                                    | `Ernie4_5_ForCausalLM`<br>`Ernie4_5_MoeForCausalLM` |  |  |
-| **EXAONE 4.0**                                   | `Exaone4ForCausalLM` |  |  |
-| **Gemma 2**                                      | `Gemma2ForCausalLM` |  |  |
-| **Gemma 3**                                      | `Gemma3ForCausalLM`<br>`Gemma3ForConditionalGeneration` | ✓ |  |
-| **Gemma 4**                                      | `Gemma4ForConditionalGeneration`<br>`Gemma4UnifiedForConditionalGeneration` | ✓ | E2B/E4B unsupported |
-| **GLM 4**, **GLM 4.6**, etc.                     | `Glm4ForCausalLM`<br>`Glm4MoeForCausalLM` |  |  |
-| **GLM 4.1V**, **GLM 4.5V**                       | `Glm4vForConditionalGeneration`<br>`Glm4vMoeForConditionalGeneration` | ✓ |  |
-| **GLM 4.7 Flash**                                | `Glm4MoeLiteForCausalLM` |  |  |
-| **GLM 5.2**                                      | `GlmMoeDsaForCausalLM` |  |  |
-| **GLM 5.3-Flash**                                | `Glm5NextForConditionalGeneration` | ✓ |  |
-| **GPT-OSS**                                      | `GptOssForCausalLM` |  |  |
-| **HyperCLOVAX**                                  | `HyperCLOVAXForCausalLM`<br>`HCXVisionV2ForCausalLM` | ✓ |  |
-| **Hy3**                                          | `HYV3ForCausalLM` |  |  |
-| **IQuest-Coder**                                 | `IQuestCoderForCausalLM` |  |  |
-| **Kimi Linear**                                  | `KimiLinearForCausalLM` |  |  |
-| **Laguna 2.1**                                   | `LagunaForCausalLM` |  |  |
-| **LFM 2.5**                                      | `Lfm2ForCausalLM`<br>`Lfm2MoeForCausalLM` |  |  |
-| **Llama 1/2/3**,**3.1-Nemotron** etc.            | `LlamaForCausalLM` |  |  |
-| **MiMo-RL**                                      | `MiMoForCausalLM` |  |  |
-| **MiniMax-M2**                                   | `MiniMaxM2ForCausalLM` |  |  |
-| **Mistral**, **Ministral 3**, **Mistral-4** etc. | `MistralForCausalLM`<br>`Mistral3ForConditionalGeneration` | ✓ |  |
-| **Mixtral**                                      | `MixtralForCausalLM` |  |  |
-| **NemotronH, Nemotron-3 Nano/Super**              | `NemotronHForCausalLM` |  |  |
-| **Olmo 3.1**                                     | `Olmo3ForCausalLM` |  |  |
-| **Olmo-Hybrid**                                  | `OlmoHybridForCausalLM` |  |  |
-| **Phi3**, **Phi4**                               | `Phi3ForCausalLM` |  |  |
-| **Qwen 2**, **Qwen 2.5**, **Qwen 2.5 VL**        | `Qwen2ForCausalLM`<br>`Qwen2_5_VLForConditionalGeneration` | ✓ |  |
-| **Qwen 3**                                       | `Qwen3ForCausalLM`<br>`Qwen3MoeForCausalLM` |  |  |
-| **Qwen 3-Next**                                  | `Qwen3NextForCausalLM` |  |  |
-| **Qwen 3-VL**                                    | `Qwen3VLForConditionalGeneration` | ✓ |  |
-| **Qwen 3-VL MoE**                                | `Qwen3VLMoeForConditionalGeneration` | ✓ |  |
-| **Qwen 3.5**                                     | `Qwen3_5ForConditionalGeneration` | ✓ |  |
-| **Qwen 3.5 MoE**                                 | `Qwen3_5MoeForConditionalGeneration` | ✓ |  |
-| **Qwen 3.8-Flash-Next**                          | `Qwen4ExpForConditionalGeneration` | ✓ |  |
-| **Seed-OSS**                                     | `SeedOssForCausalLM` |  |  |
-| **SmolLM**                                       | `SmolLM3ForCausalLM` |  |  |
-| **SolarOpen**                                    | `SolarOpenForCausalLM` |  |  |
-| **Step 3.5 Flash**                               | `Step3p5ForCausalLM` |  |  |
-| **Step 3.7 Flash**                               | `Step3p7ForConditionalGeneration` | ✓ |  |
-
-Always adding more, stay tuned.
-
-## Conversion
-
-To convert a model to EXL3 format, use:
-
-```sh
-# Convert model
-python convert.py -i <input_dir> -o <output_dir> -w <working_dir> -b <bitrate>
-
-# Resume an interrupted quant job
-python convert.py -w <working_dir> -r
-
-# More options
-python convert.py -h
-```
-
-The working directory is temporary storage for state checkpoints and for storing quantized tensors 
-until the converted model can be compiled. It should have enough free space to store an entire copy 
-of the output model.
-
-See the [conversion guide](doc/convert.md) for more information, or the 
-[self-calibration guide](doc/optimize.md). 
-
-## EXL3 quantization
-
-EXL3 quantization is a streamlined variant of [**QTIP**](https://github.com/Cornell-RelaxML/qtip) from Cornell RelaxML. It aims to make
-SOTA quantization available to users on consumer hardware. The conversion process is designed to be
-simple and efficient and requires only an input model (in HF format) and a target bitrate. By
-computing Hessians on the fly and thanks to a fused Viterbi kernel, the quantizer can convert a 
-model in a single step, taking a couple of minutes for smaller models, up to a few hours for larger
-ones (70B+) on a single high-end consumer GPU (see the [conversion guide](doc/convert.md)).
-
-For more information, see the [**QTIP**](https://arxiv.org/abs/2406.11235) and [**QuIP#**](https://arxiv.org/abs/2402.04396) papers, as well as this 
-[excellent writeup](https://www.together.ai/blog/even-better-even-faster-quantized-llms-with-qtip) on **QTIP** from together.ai.
-
-
-## Community
-
-You are always welcome to join the [ExLlama discord server](https://discord.gg/NSFwVuCjRq) ←🎮
-
-
-### 🤗 Models on Hugging Face
-
-Browse the [EXL3 model collection](https://huggingface.co/collections/turboderp/exl3-models-67f2dfe530f05cb9f596d21a) for quantized models. Also shout out to the following lovely
-people:
-
-- [ArtusDev](https://huggingface.co/ArtusDev)
-- [MikeRoz](https://huggingface.co/MikeRoz)
-- [MetaphoricalCode](https://huggingface.co/MetaphoricalCode)
-- [Ready.Art](https://huggingface.co/ReadyArt)
-- [isogen](https://huggingface.co/isogen/models)
-
-
-## Acknowledgements
-
-This project owes its existence to a wonderful community of FOSS developers and some very generous
-supporters (🐈❤️!) The following projects in particular deserve a special mention:
-
-- [TabbyAPI](https://github.com/theroyallab/tabbyAPI/)
-- [PyTorch](https://github.com/pytorch/pytorch)
-- [FlashAttention](https://github.com/Dao-AILab/flash-attention)
-- [QTIP](https://github.com/Cornell-RelaxML/qtip)
-- [Transformers](https://github.com/huggingface/transformers)
-- [Marlin](https://github.com/IST-DASLab/marlin)
-- [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention) (chunked linear-attention prefill kernels, vendored under `exllamav3/vendor/fla`)
-
-<p align="center">
-  <img src="doc/cat.png" width="40" alt="">
-</p>
-
-
+- exllamav3 by turboderp and contributors, MIT License (see [LICENSE](LICENSE)); this fork keeps it.
+- TabbyAPI (AGPL-3.0) is not included; `rocm/tabbyapi/` only contains a patch and config files.
+- Models by the Qwen team, EXL3 quants and DFlash2 draft by Mia-AiLab (see their model cards for licenses).

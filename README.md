@@ -21,19 +21,19 @@ Decode speed, greedy, code-style prompt, 8-bit KV cache (DFlash2 draft KV 4-bit)
 
 | Context | DFlash2 (default) | MTP | No draft |
 |---|---|---|---|
-| 2K | **135 tok/s** | 99 tok/s | 38.5 tok/s |
-| 32K | **131 tok/s** | 88 tok/s | 36.3 tok/s |
-| 99K | **101 tok/s** | 64 tok/s | - |
+| 2K | **152 tok/s** | 111 tok/s | 38.5 tok/s |
+| 32K | **143 tok/s** | 93 tok/s | 36.3 tok/s |
+| 99K | **107 tok/s** | 68 tok/s | - |
 
-(No-draft column measured before the kernel-fusion round.)
+(No-draft column measured before the kernel-fusion rounds.)
 
 Short prompts, 512 generated tokens, greedy (`rocm_tests/bench_gen.py`):
 
 | Workload | DFlash2 | MTP (3 draft tokens) |
 |---|---|---|
-| Code | 122-125 tok/s | 97 tok/s |
-| Explanation | 90-92 tok/s | 77 tok/s |
-| Prose / story | 66-67 tok/s | 71 tok/s |
+| Code | 134 tok/s | 101 tok/s |
+| Explanation | 98 tok/s | 82 tok/s |
+| Prose / story | 70 tok/s | 73 tok/s |
 
 Run-to-run variance is noticeable (occasional runs 10-20% slower); profiling shows the extra time is host
 side (GPU idle between launches), not in the kernels.
@@ -158,6 +158,10 @@ GEMV/GEMM kernels:
   `out_proj` (one head = one 128-element Hadamard block; matches `gated_rms_norm` to fp16 rounding).
 - `mul1` pair packing with `v_sad_hi_u8` (the second byte sum lands in the high half directly): one
   VALU op less per weight pair, ~2-4% faster decode matmuls.
+- RMSNorm feeding a projection bundle (MLP gate/up, DeltaNet qkv/z) writes that bundle's matmul input
+  transform in its tail (`rms_norm_had`), so the matmul skips its input kernel (eager path; the
+  hand-off is matched on input pointer, suh table and shape, and dropped by any other matmul).
+- Prefetch ring depth 4 k-slices (was 8): 1-4% faster at 1-8 rows.
 - Grid sizing: the k-split targets one residency wave (6 blocks per WGP = 288, LDS-limited); a partial second
   wave of blocks roughly doubles the kernel tail. 3-10% faster per matmul in isolation (`kbench`),
   neutral end-to-end.
@@ -207,6 +211,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_FUSE_ACT` | 1 | 0 = separate `silu_mul` / `mul_sigmoid_` kernels before the MLP down projection / attention `o_proj` |
 | `EXL3_FUSE_GNORM` | 1 | 0 = separate gated RMSNorm kernel before the DeltaNet `out_proj` |
 | `EXL3_GDN_REG` | 1 | 0 = original DeltaNet recurrence kernel (state re-read from memory per token) |
+| `EXL3_FUSE_NORM_HAD` | 1 | 0 = no matmul input transform in the RMSNorm tail |
 | `EXL3_RESID_DEFER` | 1 | 0 = no residual-add folding into the next block's input norm |
 | `EXL3_NOGRAPH` | - (`mlp,gdn` in `run_tabbyapi.sh`) | modules (`mlp`, `gdn`, `attn`) that decode eagerly instead of through a HIP graph |
 | `EXL3_PF_BLOCK_M`, `EXL3_PF_BLOCK_N`, `EXL3_PF_WARPS` | - | Triton prefill tile overrides |
@@ -245,7 +250,12 @@ produces the same text as plain decoding for the DFlash2 path in these tests.
   turnaround after each verification. HIP graphs save little on ROCm: `hipGraphLaunch` costs CPU time
   per node like eager launches, and each graph launch adds ~8 us of GPU idle. Replacing the per-module
   graphs with eager launches (`EXL3_NOGRAPH=mlp,gdn`) is ~0.5% faster; merging attention + MLP graphs
-  per layer would save at most ~0.5 ms per ~41 ms round, so it was not done.
+  per layer would save at most ~0.5 ms per ~41 ms round, so it was not done. Runtime knobs (`HIP_FORCE_DEV_KERNARG`, `HSA_ENABLE_INTERRUPT`,
+  `GPU_MAX_HW_QUEUES`) do not change the ~3.3 us per-kernel dispatch cost on this setup.
+- Tried and dropped (measured, no gain): persistent/work-queue matmul scheduling, larger or smaller x
+  chunks in LDS, 2 tiles per wave, split accumulators, prefetching the DeltaNet inputs, replaying the
+  DeltaNet state on rollback instead of storing per-token history (the recurrence is latency-bound,
+  the replay cost more than the saved writes), GPU-side embedding gather (the CPU lookup is ~0.1 ms).
 
 ## Notes on published RTX 3090 / Arc B70 numbers
 

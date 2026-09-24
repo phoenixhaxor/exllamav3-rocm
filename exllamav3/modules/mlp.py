@@ -718,6 +718,14 @@ class GatedMLP(Module):
         self.load_local(self.device, 0)
 
 
+    def input_bundle(self, x: torch.Tensor):
+        """(suh table, sources) of the fused gate/up matmul that will consume x on the graphed BC path,
+        for the input norm's fused transform (RMSNorm had_for); None if that path won't run"""
+        mgu = self.multi_gu[0] if self.num_slices == 1 else None
+        if self.bc is None or mgu is None or x.numel() // x.shape[-1] > MAX_BSZN:
+            return None
+        return (mgu.ptrs_suh, mgu.num_linears)
+
     @override
     def forward(
         self,

@@ -5,6 +5,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
 #include "util.cuh"
+#include "quant/exl3_rdna3_had.cuh"
+#include "quant/exl3_rdna3.cuh"
 
 #ifdef __HIP_PLATFORM_AMD__
 // ROCm bf16 scalar shims (ROCm hanya punya varian pair)
@@ -175,6 +177,16 @@ __device__ inline float reduce_dyn(float sum, int warp_id, int lane_id)
 #define RES_POST 1
 #define RES_IN 2
 
+// Optional tail: after writing its (fp16) output row, the block emits the RDNA3 EXL3 matmul input
+// transform of that row for num_src sources (suh table), so the consumer skips its own input kernel
+struct RmsHadTail
+{
+    const uint64_t* suh_tab;   // null: no tail
+    uint2* xh;
+    float* xcs;
+    int num_src;
+};
+
 template <int res_mode, typename input_t, typename output_t, typename weight_t, typename residual_t>
 __global__ __launch_bounds__(NUM_THREADS)
 void rms_norm_kernel
@@ -188,7 +200,8 @@ void rms_norm_kernel
     const int dim,
     const float constant_bias,
     const float constant_scale,
-    const int w_groups          // weight spans w_groups rows, cycled by row index (grouped norm)
+    const int w_groups,         // weight spans w_groups rows, cycled by row index (grouped norm)
+    const RmsHadTail tail
 )
 {
     constexpr bool input_fp32 = std::is_same_v<input_t, float>;
@@ -324,6 +337,31 @@ void rms_norm_kernel
             apply_out(x4, column, rmf);
         }
     }
+
+    #ifdef __HIP_PLATFORM_AMD__
+    if constexpr (output_fp16 && res_mode != RES_POST)
+    {
+        if (tail.suh_tab)
+        {
+            __syncthreads();   // the block's output row is complete (and visible to the block)
+            const int kblocks = dim / 128;
+            const int warps = blockDim.x / 32;
+            for (int task = warp_id; task < kblocks * tail.num_src; task += warps)
+            {
+                const int src = task / kblocks;
+                const int c = task % kblocks;
+                const half2* yp = (const half2*) (((const half*) y) + row_off + c * 128 + lane_id * 4);
+                exl3_rdna3_had::transform_block
+                (
+                    yp[0], yp[1], (const half*) tail.suh_tab[src],
+                    tail.xh + (size_t) src * rows * (dim / 16) * 4,
+                    tail.xcs + (size_t) src * rows * kblocks,
+                    row, c, dim, lane_id
+                );
+            }
+        }
+    }
+    #endif
 }
 
 /*
@@ -345,7 +383,8 @@ void rms_norm_impl
     bool span_heads,
     int res_mode,
     Graph* graph = nullptr,
-    int w_groups = 1
+    int w_groups = 1,
+    RmsHadTail tail = {}
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -413,7 +452,8 @@ void rms_norm_impl
             dim,                                                                    \
             constant_bias,                                                          \
             constant_scale,                                                         \
-            w_groups                                                                \
+            w_groups,                                                               \
+            tail                                                                    \
         );
 
     //      x_type________ w_type_____________  y_type_______        mode      r_type
@@ -496,6 +536,40 @@ void rms_norm_gr
 )
 {
     rms_norm_impl(x, w, y, {}, epsilon, constant_bias, constant_scale, false, RES_NONE, graph);
+}
+
+// RMSNorm (optionally with the fused pre-norm residual add, r += x) whose tail also writes the RDNA3
+// EXL3 matmul input transform of y for the num_src matrices of a MultiLinear / SlicedMultiLinear
+// (suh_tab). The next exl3_mgemm on y with that table then skips its input kernel. Returns false
+// (nothing launched) where it doesn't apply
+bool rms_norm_had
+(
+    at::Tensor x,
+    c10::optional<at::Tensor> w,
+    at::Tensor y,
+    c10::optional<at::Tensor> r,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    at::Tensor suh_tab,
+    int num_src
+)
+{
+    #ifdef __HIP_PLATFORM_AMD__
+        if (y.scalar_type() != at::kHalf || !y.is_contiguous() || !x.is_contiguous()) return false;
+        int dim = x.size(-1);
+        if (dim % 128) return false;
+        int rows = (int) (x.numel() / dim);
+        uint2* xh;
+        float* xcs;
+        if (!exl3_rdna3_prepare_input(x.device().index(), y.data_ptr(), suh_tab.data_ptr(), rows, dim, num_src, &xh, &xcs))
+            return false;
+        RmsHadTail tail { (const uint64_t*) suh_tab.data_ptr(), xh, xcs, num_src };
+        rms_norm_impl(x, w, y, r, epsilon, constant_bias, constant_scale, false, r ? RES_IN : RES_NONE, nullptr, 1, tail);
+        return true;
+    #else
+        return false;
+    #endif
 }
 
 // Fused pre-norm residual add: r += x (in place), y = norm(r) * w

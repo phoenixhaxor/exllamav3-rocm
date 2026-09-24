@@ -6,6 +6,7 @@
 #include "../ptx.cuh"
 #include "exl3_dq.cuh"
 #include "exl3_rdna3.cuh"
+#include "exl3_rdna3_had.cuh"
 
 #ifdef __HIP_PLATFORM_AMD__
 
@@ -43,25 +44,7 @@ __device__ __forceinline__ void wave_sync()
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
 }
 
-// Natural-order 128-point Walsh-Hadamard across one wave, lane holds elements 4 * lane .. + 3
-__device__ __forceinline__ void had128(float& h0, float& h1, float& h2, float& h3, int lane)
-{
-    float s0 = h0 + h1, d0 = h0 - h1, s1 = h2 + h3, d1 = h2 - h3;
-    h0 = s0 + s1; h1 = d0 + d1; h2 = s0 - s1; h3 = d0 - d1;
-    #pragma unroll
-    for (int i = 1; i < 32; i <<= 1)
-    {
-        float p0 = __shfl_xor(h0, i);
-        float p1 = __shfl_xor(h1, i);
-        float p2 = __shfl_xor(h2, i);
-        float p3 = __shfl_xor(h3, i);
-        bool hi = lane & i;
-        h0 = hi ? p0 - h0 : h0 + p0;
-        h1 = hi ? p1 - h1 : h1 + p1;
-        h2 = hi ? p2 - h2 : h2 + p2;
-        h3 = hi ? p3 - h3 : h3 + p3;
-    }
-}
+using exl3_rdna3_had::had128;
 
 // 64-bit funnel: (a:b) >> s, low 32 bits, 0 <= s < 64
 __device__ __forceinline__ uint32_t fsh(uint32_t b, uint32_t a, int s)
@@ -280,25 +263,8 @@ void exl3_rdna3_had_kernel
             x23 = __hmul2(__hmul2(x23, sigmoid2(x23)), up[1]);
         }
     }
-    half2 a01 = __hmul2(x01, sp[0]);
-    half2 a23 = __hmul2(x23, sp[1]);
-    float h0 = __low2float(a01), h1 = __high2float(a01), h2 = __low2float(a23), h3 = __high2float(a23);
-    had128(h0, h1, h2, h3, lane);
-    const float r = 0.088388347648f;
-    const half2 p0 = __floats2half2_rn(h0 * r, h1 * r);
-    const half2 p1 = __floats2half2_rn(h2 * r, h3 * r);
-
-    float s = __low2float(p0) + __high2float(p0) + __low2float(p1) + __high2float(p1);
-    #pragma unroll
-    for (int i = 1; i < 32; i <<= 1) s += __shfl_xor(s, i);
-    if (lane == 0) xcs[(size_t) m * kblocks + c] = s;
-
-    // Elements 4 * lane .. +3 of the block: k-slice c * 8 + lane / 4, offset j0 = 4 * (lane % 4)
-    uint32_t* xrow = (uint32_t*) &xh[((size_t) m * (size_k / 16) + c * 8 + (lane >> 2)) * 4];
-    const int j0 = (lane & 3) * 4;
-    const int j1 = j0 + 2;
-    xrow[((j0 & 7) >> 1) * 2 + (j0 >> 3)] = h2u(p0);
-    xrow[((j1 & 7) >> 1) * 2 + (j1 >> 3)] = h2u(p1);
+    (void) sp;
+    exl3_rdna3_had::transform_block(x01, x23, suh, xh, xcs, m, c, size_k, lane);
 }
 #endif
 
@@ -367,7 +333,7 @@ __device__ __forceinline__ void exl3_rdna3_unit
 #ifdef KB_PF
     constexpr int PF = KB_PF;
 #else
-    constexpr int PF = (LPT > 1 || MR >= 16) ? 4 : 8;                  // prefetch ring depth, k-slices
+    constexpr int PF = 4;   // prefetch ring depth, k-slices (4 beat 8 at 1-8 rows with warm clocks)
 #endif
 
     // x chunk, [MR][KCS][4] pairs: .x = x[16 ks + 2q .. +1], .y = x[16 ks + 8 + 2q .. +1]

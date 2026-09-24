@@ -144,5 +144,10 @@ bool exl3_rdna3_mgemm
     Graph* graph
 );
 
+// Producers that write the transformed input themselves (rms_norm_had): returns the workspace and
+// records it as prepared for (A, suh_tab, m, k, num_src); the next exl3_rdna3_mgemm with exactly that
+// input skips its input kernel (eager launches only), any other RDNA3 matmul drops the record
+bool exl3_rdna3_prepare_input(int device, const void* A, const void* suh_tab, int m, int k, int num_src, uint2** xh, float** xcs);
+
 void exl3_rdna3_prepare(int device);
 bool exl3_rdna3_enabled();

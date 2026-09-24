@@ -16,6 +16,8 @@ namespace
     int* g_counters[MAX_DEVICES] = {};
     uint2* g_xh[MAX_DEVICES] = {};
     float* g_xcs[MAX_DEVICES] = {};
+    struct Prepared { const void* A; const void* suh_tab; int m, k, num_src; };
+    Prepared g_prepared[MAX_DEVICES] = {};
     int g_enabled = -1;
     int g_target_blocks = -1;
 }
@@ -108,6 +110,25 @@ static void choose_splits(int items, int kblocks, size_t ws_per_split, int devic
 
 #endif
 
+bool exl3_rdna3_prepare_input(int device, const void* A, const void* suh_tab, int m, int k, int num_src, uint2** xh, float** xcs)
+{
+    #ifdef __HIP_PLATFORM_AMD__
+        if (!exl3_rdna3_enabled()) return false;
+        static const bool fuse = !(std::getenv("EXL3_FUSE_NORM_HAD") && std::getenv("EXL3_FUSE_NORM_HAD")[0] == '0');
+        if (!fuse) return false;
+        if (k % 128) return false;
+        if ((size_t) num_src * m * k * 2 > EXL3_RDNA3_XH_BYTES) return false;
+        if ((size_t) num_src * m * (k / 128) > EXL3_RDNA3_XCS_FLOATS) return false;
+        if (!g_ws[device]) exl3_rdna3_prepare(device);
+        g_prepared[device] = { A, suh_tab, m, k, num_src };
+        *xh = g_xh[device];
+        *xcs = g_xcs[device];
+        return true;
+    #else
+        return false;
+    #endif
+}
+
 bool exl3_rdna3_gemm
 (
     const half* A,
@@ -131,6 +152,7 @@ bool exl3_rdna3_gemm
 {
     #ifdef __HIP_PLATFORM_AMD__
         if (!exl3_rdna3_enabled()) return false;
+        g_prepared[device].A = nullptr;   // this launch overwrites the input workspace
         if (!suh || !svh) return false;
         if (size_k % 128 || size_n % 128) return false;
         if (K < 1 || K > 8) return false;
@@ -244,8 +266,13 @@ bool exl3_rdna3_mgemm
 
         uint2* xh = g_xh[device];
         float* xcs = g_xcs[device];
+        const Prepared& pr = g_prepared[device];
+        const bool prepared = !graph && pr.A == (const void*) A && pr.suh_tab == (const void*) suh_tab &&
+                              pr.m == size_m && pr.k == size_k && pr.num_src == num_src;
+        g_prepared[device].A = nullptr;
         const int had_tasks = size_m * kblocks;
-        exl3_rdna3_had_kernel<<<dim3((had_tasks + 7) / 8, num_src), 256, 0, stream>>>(A, nullptr, xh, xcs, size_m, size_k, suh_tab, nullptr, Exl3Rdna3GNorm {});
+        if (!prepared)
+            exl3_rdna3_had_kernel<<<dim3((had_tasks + 7) / 8, num_src), 256, 0, stream>>>(A, nullptr, xh, xcs, size_m, size_k, suh_tab, nullptr, Exl3Rdna3GNorm {});
 
         Exl3Rdna3MTab mt { b_tab, svh_tab, c_tab, n_stride_tab, src_tab };
         kernel<<<dim3(groups * splits, row_chunks, num_entries), EXL3_RDNA3_THREADS, 0, stream>>>

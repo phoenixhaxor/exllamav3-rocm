@@ -97,6 +97,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("add_residual"), py::arg("w_groups") = 1);
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
+    m.def("rms_norm_had", &rms_norm_had, "rms_norm_had");
     m.def("softcap", &softcap, "softcap");
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");

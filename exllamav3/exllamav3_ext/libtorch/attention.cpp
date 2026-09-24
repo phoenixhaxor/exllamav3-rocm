@@ -867,7 +867,8 @@ void BC_Attention::run
 
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
     // captured, then launched below like every later run, with only the I/O pointers patched
-    if (s.runs == 0)
+    static const bool nograph = graph_disabled_for("attn");
+    if (s.runs == 0 || nograph)
     {
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr);
         s.runs = 1;

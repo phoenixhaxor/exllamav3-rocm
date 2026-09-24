@@ -198,6 +198,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_HIP_MGEMM` | 1 | 0 = run bundled projections (gate/up, qkv/z, q/k/v) as separate matmuls |
 | `EXL3_FUSE_ACT` | 1 | 0 = separate `silu_mul` kernel before the MLP down projection |
 | `EXL3_RESID_DEFER` | 1 | 0 = no residual-add folding into the next block's input norm |
+| `EXL3_NOGRAPH` | - (`mlp,gdn` in `run_tabbyapi.sh`) | modules (`mlp`, `gdn`, `attn`) that decode eagerly instead of through a HIP graph |
 | `EXL3_PF_BLOCK_M`, `EXL3_PF_BLOCK_N`, `EXL3_PF_WARPS` | - | Triton prefill tile overrides |
 
 ## Tests and benchmarks (`rocm_tests/`)
@@ -229,9 +230,12 @@ produces the same text as plain decoding for the DFlash2 path in these tests.
 - HIP attention kernels cover causal full attention without softcap or sinks, head dim 128/256,
   q_len up to 16 (WMMA verification up to 8, 8-bit cache); other shapes use the Triton kernels.
 - Quantization (conversion) kernels compile but are untested on ROCm.
-- The 8-row matmul (codebook decode + FMA) is ~78% of GPU time per speculative round. About 18% of
-  each round is GPU idle time: ~4 us per kernel boundary inside HIP graphs, ~13 us per graph launch
-  (two graphs per layer) and the host-side turnaround after each verification.
+- The 8-row matmul (codebook decode + FMA) is ~78% of GPU time per speculative round. About 16-18% of
+  each round is GPU idle time: ~3 us per kernel boundary (graph or eager alike) and the host-side
+  turnaround after each verification. HIP graphs save little on ROCm: `hipGraphLaunch` costs CPU time
+  per node like eager launches, and each graph launch adds ~8 us of GPU idle. Replacing the per-module
+  graphs with eager launches (`EXL3_NOGRAPH=mlp,gdn`) is ~0.5% faster; merging attention + MLP graphs
+  per layer would save at most ~0.5 ms per ~41 ms round, so it was not done.
 
 ## Notes on published RTX 3090 / Arc B70 numbers
 

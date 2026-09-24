@@ -111,7 +111,8 @@ void BC_GatedMLP::run_bszN
 
     Graph& g = graph_bszN[graphidx];
 
-    if (g.disabled || (!g.ready && !g.ready_to_record))
+    static const bool nograph = graph_disabled_for("mlp");
+    if (nograph || g.disabled || (!g.ready && !g.ready_to_record))
     {
         run_bszN_gr(x, d, num_tokens, nullptr);
         g.ready_to_record = true;

@@ -344,7 +344,8 @@ void BC_GatedDeltaNetSplit::run_bszN
     Slot& s = slot(bsz, seqlen, history);
     TORCH_CHECK(s.configured, "BC_GatedDeltaNetSplit::run_bszN: slot not configured");
 
-    if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
+    static const bool nograph = graph_disabled_for("gdn");
+    if (nograph || s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
     {
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
         s.graph->ready_to_record = true;

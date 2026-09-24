@@ -1,5 +1,6 @@
 #include <Python.h>
 #include <cstring>
+#include <cstdlib>
 #include "graph.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -20,6 +21,22 @@
 #endif
 
 //#define GRAPHDEBUG 1
+
+bool graph_disabled_for(const char* name)
+{
+    const char* e = std::getenv("EXL3_NOGRAPH");
+    if (!e) return false;
+    const size_t n = strlen(name);
+    for (const char* p = e; *p; )
+    {
+        const char* q = strchr(p, ',');
+        size_t len = q ? (size_t) (q - p) : strlen(p);
+        if (len == n && !strncmp(p, name, n)) return true;
+        if (!q) break;
+        p = q + 1;
+    }
+    return false;
+}
 
 Graph::Graph()
 {

@@ -137,3 +137,8 @@ public:
     void inspect_graph();
 };
 
+// EXL3_NOGRAPH=name[,name...]: modules that run their decode path eagerly instead of through a
+// captured graph ("mlp", "gdn", "attn"). A graph launch costs several us of GPU idle time on ROCm
+// on top of the per-kernel boundary, which loses to eager launches for short graphs
+bool graph_disabled_for(const char* name);
+

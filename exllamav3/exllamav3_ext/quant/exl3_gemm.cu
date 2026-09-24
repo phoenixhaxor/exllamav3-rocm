@@ -399,6 +399,54 @@ Limitations: k must be divisible by 16 and n by 128. Range filtering supports
 at most 128 slots (the kernel's index-compaction capacity).
 */
 
+// Gated MLP down projection with the activation folded into the input transform:
+// C = (silu(g) * u) @ W, bit-identical to silu_mul (fp16) followed by exl3_gemm. Returns false
+// (nothing launched) where the fused RDNA3 path doesn't apply
+bool exl3_gemm_silu_gr
+(
+    const at::Tensor& g,
+    const at::Tensor& u,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const at::Tensor& suh,
+    const at::Tensor& svh,
+    bool mcg,
+    bool mul1,
+    Graph* graph
+)
+{
+    #ifdef __HIP_PLATFORM_AMD__
+        if (g.dtype() != at::kHalf || u.dtype() != at::kHalf) return false;
+        if (!g.is_contiguous() || !u.is_contiguous() || g.numel() != u.numel()) return false;
+        bool c_fp32 = C.dtype() == at::kFloat;
+        if (!c_fp32 && C.dtype() != at::kHalf) return false;
+
+        const at::cuda::OptionalCUDAGuard device_guard(g.device());
+        cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+        const int tile_u16 = B.size(2);
+        const bool half_k = (tile_u16 % 16) != 0;
+        const int K = tile_u16 / 16;
+        const int size_k = g.size(-1);
+        const int size_m = (int) (g.numel() / size_k);
+        const int size_n = B.size(1) * 16;
+        TORCH_CHECK(B.size(0) * 16 == size_k, "exl3_gemm_silu: k mismatch");
+        TORCH_CHECK(C.numel() == (int64_t) size_m * size_n, "exl3_gemm_silu: output shape mismatch");
+        const int cb = mul1 ? 2 : (mcg ? 1 : 0);
+
+        int device;
+        cudaGetDevice(&device);
+        return exl3_rdna3_gemm
+        (
+            (const half*) g.data_ptr(), (const uint16_t*) B.data_ptr(), C.data_ptr(), size_m, size_k, size_n,
+            K, half_k, cb, c_fp32, (const half*) suh.data_ptr(), (const half*) svh.data_ptr(), device, stream,
+            graph, (const half*) u.data_ptr()
+        );
+    #else
+        return false;
+    #endif
+}
+
 int exl3_mgemm_gr
 (
     const at::Tensor& A,
@@ -548,6 +596,21 @@ int exl3_mgemm_gr
     const int K = bk.bits;
     const bool half_k = bk.half;
     TORCH_CHECK(!half_k || mul1, "exl3_mgemm: half-integer bitrates require the mul1 codebook");
+
+    // RDNA3: shared-input bundles (no routing) as one had + one matmul launch, blockIdx.z per entry
+    #ifdef __HIP_PLATFORM_AMD__
+    if (bszm_in == 1 && !indices && !weights && min_index < 0 && num_tokens == 1)
+    {
+        const int num_src = had_src_list ? num_had_src : bszm_out;
+        if (exl3_rdna3_mgemm
+        (
+            A_ptr, (const uint64_t*) B_ptr_ptr, C_ptr, size_m, size_k, size_n, K, half_k, cb, c_fp32,
+            (const uint64_t*) suh_ptr_ptr, (const uint64_t*) svh_ptr_ptr, (const uint64_t*) c_list_ptr,
+            n_stride_list_ptr, had_src_list_ptr, bszm_out, num_src, device, stream, graph
+        ))
+            return 91;
+    }
+    #endif
 
     int shape_idx;
     int block_dim;

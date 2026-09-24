@@ -32,6 +32,19 @@ int exl3_gemm
     int force_num_sms
 );
 
+bool exl3_gemm_silu_gr
+(
+    const at::Tensor& g,
+    const at::Tensor& u,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const at::Tensor& suh,
+    const at::Tensor& svh,
+    bool mcg,
+    bool mul1,
+    Graph* graph
+);
+
 int exl3_mgemm_gr
 (
     const at::Tensor& A,

@@ -2,6 +2,7 @@
 
 #include <ATen/Tensor.h>
 #include <vector>
+#include <cstdlib>
 #include <pybind11/pybind11.h>
 namespace py = pybind11;
 
@@ -36,6 +37,8 @@ struct BC_GatedMLP
     std::shared_ptr<BC_LinearEXL3> up;
     std::shared_ptr<BC_LinearEXL3> down;
     float act_limit;
+    // RDNA3: fold silu(g) * u into the down projection's input transform (EXL3_FUSE_ACT=0 disables)
+    bool fuse_act_down = !(std::getenv("EXL3_FUSE_ACT") && std::getenv("EXL3_FUSE_ACT")[0] == '0');
 
     // graph_bszN[num_tokens - 1] covers num_tokens 1..MAX_BSZN (num_tokens==1 behaves exactly as
     // the original dedicated bsz-1 path)

@@ -31,6 +31,17 @@
 #define EXL3_RDNA3_XH_BYTES (16ull << 20)
 #define EXL3_RDNA3_XCS_FLOATS (1 << 18)
 
+// Multi-matrix mode (blockIdx.z = entry): per-entry trellis / svh / output pointers, output row
+// stride and input source. A null b table selects plain single-matrix mode
+struct Exl3Rdna3MTab
+{
+    const uint64_t* b;         // trellis pointers (pre-offset to the entry's first column)
+    const uint64_t* svh;       // svh pointers (pre-offset)
+    const uint64_t* c;         // output pointers, or null: C + e * size_m * size_n
+    const int* n_stride;       // row stride of trellis and output, or null: size_n
+    const int* src;            // input source (xh / xcs slab), or null: e
+};
+
 typedef void (*fp_exl3_rdna3_kernel)
 (
     const uint2* __restrict__ xh,
@@ -44,7 +55,8 @@ typedef void (*fp_exl3_rdna3_kernel)
     float* __restrict__ ws,
     const half* __restrict__ svh,
     int splits,
-    int ks_per_split
+    int ks_per_split,
+    Exl3Rdna3MTab mt
 );
 
 fp_exl3_rdna3_kernel exl3_rdna3_get_k1(bool half_k, int cb, int mr_idx, bool c_fp32);
@@ -65,7 +77,9 @@ __global__ void exl3_rdna3_had_kernel
     uint2* __restrict__ xh,
     float* __restrict__ xcs,
     int size_m,
-    int size_k
+    int size_k,
+    const uint64_t* __restrict__ suh_tab,
+    const half* __restrict__ A_up
 );
 
 // Returns true if the matmul was launched
@@ -83,6 +97,32 @@ bool exl3_rdna3_gemm
     bool c_fp32,
     const half* suh,
     const half* svh,
+    int device,
+    cudaStream_t stream,
+    Graph* graph,
+    const half* A_up = nullptr   // gated MLP down projection: input is silu(A) * A_up
+);
+
+// Several matrices sharing one input (MultiLinear / SlicedMultiLinear tables), one launch pair
+bool exl3_rdna3_mgemm
+(
+    const half* A,
+    const uint64_t* b_tab,
+    void* C,
+    int size_m,
+    int size_k,
+    int size_n,
+    int K,
+    bool half_k,
+    int cb,
+    bool c_fp32,
+    const uint64_t* suh_tab,
+    const uint64_t* svh_tab,
+    const uint64_t* c_tab,
+    const int* n_stride_tab,
+    const int* src_tab,
+    int num_entries,
+    int num_src,
     int device,
     cudaStream_t stream,
     Graph* graph

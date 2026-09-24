@@ -21,21 +21,26 @@ Decode speed, greedy, code-style prompt, 8-bit KV cache (DFlash2 draft KV 4-bit)
 
 | Context | DFlash2 (default) | MTP | No draft |
 |---|---|---|---|
-| 2K | 97-115 tok/s | 87 tok/s | 38.5 tok/s |
-| 32K | **117 tok/s** | 79 tok/s | 36.3 tok/s |
-| 99K | **84 tok/s** | 58 tok/s | - |
+| 2K | **135 tok/s** | 99 tok/s | 38.5 tok/s |
+| 32K | **131 tok/s** | 88 tok/s | 36.3 tok/s |
+| 99K | **101 tok/s** | 64 tok/s | - |
 
-Short prompts, 400 generated tokens, greedy (`rocm_tests/bench_gen.py`):
+(No-draft column measured before the kernel-fusion round.)
+
+Short prompts, 512 generated tokens, greedy (`rocm_tests/bench_gen.py`):
 
 | Workload | DFlash2 | MTP (3 draft tokens) |
 |---|---|---|
-| Code | 115 tok/s | 88 tok/s |
-| Explanation | 81 tok/s | 67 tok/s |
-| Prose / story | 62 tok/s | 62 tok/s |
+| Code | 122-125 tok/s | 97 tok/s |
+| Explanation | 90-92 tok/s | 77 tok/s |
+| Prose / story | 66-67 tok/s | 71 tok/s |
 
-Through the TabbyAPI OpenAI endpoint (temperature 0.6): code 108-119 tok/s, prose 57-61 tok/s.
+Run-to-run variance is noticeable (occasional runs 10-20% slower); profiling shows the extra time is host
+side (GPU idle between launches), not in the kernels.
 
-Prompt processing (prefill): ~1170 tok/s at 32K, ~1090 tok/s at 64K, ~940 tok/s at 99K. Long-context
+Through the TabbyAPI OpenAI endpoint (temperature 0.6, 400 tokens): code 94-109 tok/s, prose 63-66 tok/s.
+
+Prompt processing (prefill): ~1180-1200 tok/s at 32K, ~1090 tok/s at 64K, ~945 tok/s at 99K. Long-context
 retrieval (needle in a haystack through the API): 184,656-token prompt with the DFlash2 / 192K profile
 and 247,056-token prompt with the MTP / 256K profile, both answered correctly.
 
@@ -142,6 +147,16 @@ GEMV/GEMM kernels:
   window extraction; the codebook's affine map is folded into the epilogue so weights enter
   `v_dot2_f32_f16` raw.
 - Instantiated for 1-8 bit (and x.5 with `mul1`), rows per pass 1/2/3/4/5/6/8/12/16.
+- Multi-matrix mode (`exl3_rdna3_mgemm`, blockIdx.z per entry): projections that share an input run as
+  one input-transform launch plus one matmul launch, driven by the existing `MultiLinear` /
+  `SlicedMultiLinear` pointer tables: MLP gate + up, Gated DeltaNet qkv + z (8 slices of 2048),
+  attention q / k / v (14 slices of 1024). 3.3% less time per speculative round than separate matmuls
+  (~320 fewer kernels per round; q/k/v alone is 26-28% faster at 5-8 rows).
+- Gated MLP: `silu(gate) * up` is computed inside the down projection's input transform (same fp16
+  rounding as `silu_mul`), one kernel less per MLP.
+- Grid sizing: the k-split targets one residency wave (3 blocks per CU, LDS-limited); a partial second
+  wave of blocks roughly doubles the kernel tail. 3-10% faster per matmul in isolation (`kbench`),
+  neutral end-to-end.
 
 Achieved bandwidth on 4-bit tensors: ~700-770 GB/s at 1 row, ~450-530 GB/s at 8 rows (VALU-bound).
 
@@ -168,8 +183,9 @@ verification from ~45 ms to ~14 ms per round.
 - Triton decode split kernel: skips keys before the sliding window (the DFlash2 draft scanned the whole
   context: 13 ms -> 1.2 ms per round at 100K).
 - `gdn_ba_gemv`: 16-byte loads and `v_dot2` with independent accumulators.
-- Fused multi-matrix `mgemm` bundling is disabled on HIP (`use_mgemm` returns False); projections run as
-  separate RDNA3 matmuls.
+- Residual adds: a transformer block hands its final `x += mlp(x)` to the next block's input RMSNorm
+  (`rms_norm_res_in`, already used between attention and MLP), removing ~58 elementwise kernels per
+  round.
 
 ## Environment switches
 
@@ -178,8 +194,10 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_RDNA3_GEMM` | 1 | 0 = fall back to the (emulated) upstream EXL3 kernels |
 | `EXL3_RDNA3_ATTN` | 1 | 0 = Triton decode attention |
 | `EXL3_RDNA3_ATTN_SPLIT_MULT` | 16 | kv splits per CU for the HIP attention kernels (cap 128) |
-| `EXL3_RDNA3_TARGET_BLOCKS` | 4 x CUs | grid size target for the EXL3 matmul k-split |
-| `EXL3_HIP_MGEMM` | 0 | 1 = allow the fused multi-matrix paths (not ported) |
+| `EXL3_RDNA3_TARGET_BLOCKS` | 3 x CUs | grid size target for the EXL3 matmul k-split |
+| `EXL3_HIP_MGEMM` | 1 | 0 = run bundled projections (gate/up, qkv/z, q/k/v) as separate matmuls |
+| `EXL3_FUSE_ACT` | 1 | 0 = separate `silu_mul` kernel before the MLP down projection |
+| `EXL3_RESID_DEFER` | 1 | 0 = no residual-add folding into the next block's input norm |
 | `EXL3_PF_BLOCK_M`, `EXL3_PF_BLOCK_N`, `EXL3_PF_WARPS` | - | Triton prefill tile overrides |
 
 ## Tests and benchmarks (`rocm_tests/`)
@@ -187,10 +205,12 @@ verification from ~45 ms to ~14 ms per round.
 | Script | Purpose |
 |---|---|
 | `test_rdna3_gemm.py <model_dir> [tensor ...]` | EXL3 matmul vs. reconstructed weights (m = 1..144, fp16/fp32 out) and an independent numpy trellis decoder |
+| `test_rdna3_mgemm.py <model_dir>` | multi-matrix matmul (gate/up, sliced qkv/z and q/k/v) vs. separate matmuls, with timing |
+| `gaps.py -m <model> [-dm <draft>]` | GPU busy/idle per speculative round, gap histogram, kernel counts and times |
 | `bench_gen.py -m <model> [-dm <draft> \| --mtp]` | short-prompt generation speed, draft acceptance, `--image` for vision |
 | `bench_long.py 2000,32000,99000 [-dm <draft> \| --mtp]` | decode speed after long prompts (greedy, prints output with `--show`) |
 | `prof_gen.py`, `prof_long.py`, `prof_prefill.py` | kernel-time breakdowns (torch.profiler) |
-| `kbench.cc` | standalone EXL3 matmul timing harness (`hipcc -x hip`) |
+| `kbench.cc` | standalone EXL3 matmul timing harness (`hipcc -x hip`; `-DKB_TRACE` prints a per-block timeline) |
 | `attn_pf_bench.py` | prefill attention microbenchmark with a torch reference |
 | `api_test.py <url> <image>`, `needle_api.py <n> <depth>` | OpenAI API smoke test, long-context retrieval |
 | `vram.py <ctx> <kv_bits> <draft_kv_bits>` | VRAM per component |
@@ -209,8 +229,9 @@ produces the same text as plain decoding for the DFlash2 path in these tests.
 - HIP attention kernels cover causal full attention without softcap or sinks, head dim 128/256,
   q_len up to 16 (WMMA verification up to 8, 8-bit cache); other shapes use the Triton kernels.
 - Quantization (conversion) kernels compile but are untested on ROCm.
-- The 8-row matmul is VALU-bound (codebook decode + FMA); it is the largest remaining cost per
-  speculative round.
+- The 8-row matmul (codebook decode + FMA) is ~78% of GPU time per speculative round. About 18% of
+  each round is GPU idle time: ~4 us per kernel boundary inside HIP graphs, ~13 us per graph launch
+  (two graphs per layer) and the host-side turnaround after each verification.
 
 ## Notes on published RTX 3090 / Arc B70 numbers
 

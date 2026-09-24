@@ -78,14 +78,20 @@ void BC_GatedMLP::run_bszN_gr
     at::Tensor g = gu_n.select(0, 0).unsqueeze(0);
     at::Tensor u = gu_n.select(0, 1).unsqueeze(0);
 
-    if (act_silu)
+    // RDNA3: silu(g) * u folded into the down projection's input transform (one kernel less)
+    bool fused_act = act_silu && act_limit == 0.0f && fuse_act_down &&
+        exl3_gemm_silu_gr(g, u, down->trellis, d, down->suh, down->svh, down->mcg, down->mul1, graph);
+
+    if (fused_act) {}
+    else if (act_silu)
         silu_mul_gr(g, u, a_n, act_limit, graph);
     else if (act_gelu)
         gelu_mul_gr(g, u, a_n, act_limit, graph);
     else if (act_relu2)
         relu2_mul_gr(g, u, a_n, act_limit, graph);
 
-    exl3_gemm_gr(a_n, down->trellis, d, down->suh, down_xh_n, down->svh, -1, down->mcg, down->mul1, 0, graph);
+    if (!fused_act)
+        exl3_gemm_gr(a_n, down->trellis, d, down->suh, down_xh_n, down->svh, -1, down->mcg, down->mul1, 0, graph);
     if (down->bias)
         add_gr(d, down->bias.value(), d, graph);
 }

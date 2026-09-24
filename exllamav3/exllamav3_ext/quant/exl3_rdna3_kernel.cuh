@@ -18,7 +18,10 @@ namespace exl3_rdna3_ns {
 
 constexpr int NT = EXL3_RDNA3_NT;
 constexpr int THREADS = EXL3_RDNA3_THREADS;
-constexpr int XS_BYTES = 16384;     // LDS budget for the staged x chunk
+#ifndef EXL3_RDNA3_XS_BYTES
+#define EXL3_RDNA3_XS_BYTES 16384
+#endif
+constexpr int XS_BYTES = EXL3_RDNA3_XS_BYTES;   // LDS budget for the staged x chunk
 
 typedef _Float16 hv2 __attribute__((ext_vector_type(2)));
 
@@ -174,12 +177,20 @@ void exl3_rdna3_had_kernel
     uint2* __restrict__ xh,
     float* __restrict__ xcs,
     int size_m,
-    int size_k
+    int size_k,
+    const uint64_t* __restrict__ suh_tab,  // multi-source: suh per blockIdx.y, one xh / xcs slab each
+    const half* __restrict__ A_up          // gated MLP: input is silu(A) * A_up (act_mul_kernel_h rounding)
 )
 {
     using namespace exl3_rdna3_ns;
     const int lane = threadIdx.x & 31;
     const int kblocks = size_k / 128;
+    if (suh_tab)
+    {
+        suh = (const half*) suh_tab[blockIdx.y];
+        xh += (size_t) blockIdx.y * size_m * (size_k / 16) * 4;
+        xcs += (size_t) blockIdx.y * size_m * kblocks;
+    }
     const int task = blockIdx.x * 8 + (threadIdx.x >> 5);
     if (task >= size_m * kblocks) return;
     const int m = task / kblocks;
@@ -188,8 +199,20 @@ void exl3_rdna3_had_kernel
 
     const half2* ap = (const half2*) (A + (size_t) m * size_k + kbase + lane * 4);
     const half2* sp = (const half2*) (suh + kbase + lane * 4);
-    half2 a01 = __hmul2(ap[0], sp[0]);
-    half2 a23 = __hmul2(ap[1], sp[1]);
+    half2 x01 = ap[0], x23 = ap[1];
+    if (A_up)
+    {
+        const half2* up = (const half2*) (A_up + (size_t) m * size_k + kbase + lane * 4);
+        auto silu2 = [] (half2 x) -> half2
+        {
+            const half2 one = __float2half2_rn(1.0f);
+            return __hmul2(x, h2rcp(__hadd2(one, h2exp(__hneg2(x)))));
+        };
+        x01 = __hmul2(silu2(x01), up[0]);
+        x23 = __hmul2(silu2(x23), up[1]);
+    }
+    half2 a01 = __hmul2(x01, sp[0]);
+    half2 a23 = __hmul2(x23, sp[1]);
     float h0 = __low2float(a01), h1 = __high2float(a01), h2 = __low2float(a23), h3 = __high2float(a23);
     had128(h0, h1, h2, h3, lane);
     const float r = 0.088388347648f;
@@ -216,6 +239,15 @@ void exl3_rdna3_had_kernel
 #define EXL3_RDNA3_WPE __attribute__((amdgpu_waves_per_eu(KB_WPE, 16)))
 #endif
 
+#ifdef KB_TRACE
+// kbench timeline: per block [start, main loop done, finished] in steady-counter ticks (100 MHz)
+__device__ unsigned long long kb_trace[3 * 8192];
+#define KB_T(slot) do { if (threadIdx.x == 0) { const int b_ = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z); \
+    if (b_ < 8192) kb_trace[3 * b_ + (slot)] = __builtin_readsteadycounter(); } } while (0)
+#else
+#define KB_T(slot) do {} while (0)
+#endif
+
 template <int bits, bool half_k, int cb, int MR, bool c_fp32>
 __global__ __launch_bounds__(EXL3_RDNA3_THREADS) EXL3_RDNA3_WPE
 void exl3_rdna3_kernel
@@ -231,10 +263,28 @@ void exl3_rdna3_kernel
     float* __restrict__ ws,
     const half* __restrict__ svh,
     int splits,
-    int ks_per_split
+    int ks_per_split,
+    Exl3Rdna3MTab mt
 )
 {
     using namespace exl3_rdna3_ns;
+    KB_T(0);
+
+    int n_stride = size_n;
+    if (mt.b)
+    {
+        const int e = blockIdx.z;
+        const int src = mt.src ? mt.src[e] : e;
+        B = (const uint32_t*) mt.b[e];
+        svh = (const half*) mt.svh[e];
+        if (mt.c) C = (void*) mt.c[e];
+        else C = (void*) ((char*) C + (size_t) e * size_m * size_n * (c_fp32 ? 4 : 2));
+        if (mt.n_stride) n_stride = mt.n_stride[e];
+        xh += (size_t) src * size_m * (size_k / 16) * 4;
+        xcs += (size_t) src * size_m * (size_k / 128);
+        ws += (size_t) e * splits * size_m * size_n;
+        counters += (size_t) e * gridDim.y * (size_n / 128);
+    }
 
     constexpr int TWORDS = half_k ? 4 * (2 * bits + 1) : 8 * bits;   // uint32 per 16x16 tile
     constexpr int LPT = (TWORDS + 31) / 32;                            // words per lane per tile
@@ -271,7 +321,7 @@ void exl3_rdna3_kernel
     constexpr int TPW = EXL3_RDNA3_TPW;               // n-tiles per wave
     constexpr int WAVES = NT / TPW;
     const int nt0 = group * NT + warp;               // tiles nt0 + j * WAVES
-    const size_t sstride = (size_t) ntiles * TWORDS;
+    const size_t sstride = (size_t) (n_stride / 16) * TWORDS;
 
     if constexpr (RAW)
     {
@@ -439,6 +489,8 @@ void exl3_rdna3_kernel
         }
     }
 
+    KB_T(1);
+
     // Reduce over the four lanes sharing a column; lane l holds columns l / 4 and 8 + l / 4 of its tile
     #pragma unroll
     for (int m = 0; m < MR; ++m)
@@ -487,7 +539,7 @@ void exl3_rdna3_kernel
             last_flag = prev == splits - 1;
         }
         __syncthreads();
-        if (!last_flag) return;
+        if (!last_flag) { KB_T(2); return; }
         __threadfence();
 
         for (int idx = threadIdx.x; idx < rows * 128; idx += THREADS)
@@ -519,7 +571,7 @@ void exl3_rdna3_kernel
         h1 *= r * __high2float(s01);
         h2 *= r * __low2float(s23);
         h3 *= r * __high2float(s23);
-        const size_t o = (size_t) (row0 + m) * size_n + col;
+        const size_t o = (size_t) (row0 + m) * n_stride + col;
         if constexpr (c_fp32)
         {
             *((float4*) (((float*) C) + o)) = make_float4(h0, h1, h2, h3);
@@ -531,6 +583,7 @@ void exl3_rdna3_kernel
             cp[1] = __floats2half2_rn(h2, h3);
         }
     }
+    KB_T(2);
 }
 
 // Kernel table for one integer bitrate. Half-integer rates (bits + 0.5) exist for bits 1..3 with mul1 only

@@ -1,3 +1,4 @@
+#include <algorithm>
 // Standalone timing harness for exl3_rdna3_kernel (random trellis, correctness not checked)
 // build: hipcc -O3 --offload-arch=gfx1100 -I<ext>/quant -DKB_BITS=4 -DKB_MR=8 kbench.hip
 #include <hip/hip_runtime.h>
@@ -36,8 +37,8 @@ int main(int argc, char** argv)
     int kbps = (kblocks + splits - 1) / splits; splits = (kblocks + kbps - 1) / kbps;
     auto kern = exl3_rdna3_kernel<bits, false, 2, KB_MR, false>;
     auto launch = [&] {
-        exl3_rdna3_had_kernel<<<(m * kblocks + 7) / 8, 256, 0, 0>>>(A, suh, xh, xcs, m, k);
-        kern<<<dim3(groups * splits, row_chunks), EXL3_RDNA3_THREADS, 0, 0>>>(xh, B, C, m, k, n, counters, xcs, ws, svh, splits, kbps * 8);
+        exl3_rdna3_had_kernel<<<(m * kblocks + 7) / 8, 256, 0, 0>>>(A, suh, xh, xcs, m, k, nullptr, nullptr);
+        kern<<<dim3(groups * splits, row_chunks), EXL3_RDNA3_THREADS, 0, 0>>>(xh, B, C, m, k, n, counters, xcs, ws, svh, splits, kbps * 8, Exl3Rdna3MTab {});
     };
     for (int i = 0; i < 5; ++i) launch();
     hipDeviceSynchronize();
@@ -47,4 +48,25 @@ int main(int argc, char** argv)
     float ms; hipEventElapsedTime(&ms, e0, e1);
     double us = ms * 1000 / it;
     printf("bits=%d MR=%d m=%d k=%d n=%d splits=%d blocks=%d: %.1f us, %.1f GB/s\n", bits, KB_MR, m, k, n, splits, groups * splits * row_chunks, us, n_words * 4 / us / 1e3);
+#ifdef KB_TRACE
+    {
+        // One isolated launch: block timeline relative to the earliest start (us, 100 MHz ticks)
+        hipDeviceSynchronize();
+        launch();
+        hipDeviceSynchronize();
+        int nb = groups * splits * row_chunks;
+        std::vector<unsigned long long> t(3 * 8192);
+        hipMemcpyFromSymbol(t.data(), HIP_SYMBOL(kb_trace), t.size() * 8);
+        unsigned long long t0 = ~0ull, tend = 0;
+        for (int b = 0; b < nb; ++b) { t0 = std::min(t0, t[3 * b]); tend = std::max(tend, t[3 * b + 2]); }
+        auto us_ = [&] (unsigned long long v) { return (v - t0) / 100.0; };
+        std::vector<double> st, lp, en;
+        for (int b = 0; b < nb; ++b) { st.push_back(us_(t[3 * b])); lp.push_back((t[3 * b + 1] - t[3 * b]) / 100.0); en.push_back(us_(t[3 * b + 2])); }
+        auto pct = [] (std::vector<double> v, double p) { std::sort(v.begin(), v.end()); return v[(size_t) (p * (v.size() - 1))]; };
+        printf("  kernel span %.1f us | start p50 %.1f p90 %.1f max %.1f | loop p10 %.1f p50 %.1f p90 %.1f max %.1f | end p50 %.1f p90 %.1f max %.1f\n",
+               us_(tend), pct(st, .5), pct(st, .9), pct(st, 1), pct(lp, .1), pct(lp, .5), pct(lp, .9), pct(lp, 1), pct(en, .5), pct(en, .9), pct(en, 1));
+        int late = 0; for (double v : st) late += v > 2.0;
+        printf("  blocks starting > 2 us late: %d of %d\n", late, nb);
+    }
+#endif
 }

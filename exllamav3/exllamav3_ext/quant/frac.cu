@@ -13,10 +13,10 @@
 // words (K half-integer -> whole words). One warp per tile; lane t owns ring positions 8t .. 8t+7 (the
 // tensor-core element order the quantizer works in).
 
-__device__ __forceinline__ int frac_d(int i, int ka, uint32_t mask) { return ka + ((mask >> (i & 15)) & 1); }
+__device__ __forceinline__ int frac_d(int i, int ka, unsigned long long mask) { return ka + ((mask >> (i & 15)) & 1); }
 
 // Ring position where window i ends, S(i)
-__device__ __forceinline__ int frac_s(int i, int ka, uint32_t mask, int bpb)
+__device__ __forceinline__ int frac_s(int i, int ka, unsigned long long mask, int bpb)
 {
     int s = (i >> 4) * bpb;
     for (int j = 0; j <= (i & 15); ++j) s += frac_d(j, ka, mask);
@@ -45,7 +45,7 @@ __device__ __forceinline__ int frac_perm(int i)
 
 __global__ __launch_bounds__(128)
 void pack_trellis_frac_kernel(uint16_t* __restrict__ g_packed, const uint16_t* __restrict__ g_unpacked,
-                              int num_tiles, int ka, uint32_t mask, int bpb)
+                              int num_tiles, int ka, unsigned long long mask, int bpb)
 {
     const int tile = blockIdx.x * 128 + threadIdx.x;
     if (tile >= num_tiles) return;
@@ -57,7 +57,7 @@ void pack_trellis_frac_kernel(uint16_t* __restrict__ g_packed, const uint16_t* _
     for (int i = 0; i < 256; ++i)
     {
         const int d = frac_d(i, ka, mask);
-        const uint32_t v = (uint32_t) idx[i] & ((1u << d) - 1);
+        const uint32_t v = (uint32_t) idx[i] & ((1ull << d) - 1);
         for (int b = d - 1; b >= 0; --b, ++pos)
             if ((v >> b) & 1) words[pos >> 5] |= 1u << (31 - (pos & 31));
     }
@@ -67,7 +67,7 @@ void pack_trellis_frac_kernel(uint16_t* __restrict__ g_packed, const uint16_t* _
 
 __global__ __launch_bounds__(32)
 void unpack_trellis_frac_kernel(uint16_t* __restrict__ g_unpacked, const uint16_t* __restrict__ g_packed,
-                                int ka, uint32_t mask, int bpb)
+                                int ka, unsigned long long mask, int bpb)
 {
     __shared__ uint32_t words[32];
     const int tile = blockIdx.x;

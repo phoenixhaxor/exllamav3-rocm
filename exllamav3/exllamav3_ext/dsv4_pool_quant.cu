@@ -55,7 +55,7 @@ void dsv4_pool_quant_scatter_kernel
     const int g0 = warp * 4;
     if (g0 < G)
     {
-        int active = min(4, G - g0);
+        unsigned long long active = min(4, G - g0);
         quant_block_x4<bits>
         (
             row + g0 * 32,
@@ -130,7 +130,7 @@ void dsv4_pool_quant_scatter_gr
     if (grid_w <= 0) return;
 
     int threads = CEIL_DIVIDE(G, 4) * 32;
-    dsv4_pool_quant_scatter_kernel_instances[bits - 2]<<<dim3(grid_w, batch), threads, 0, stream>>>
+    auto _t0 = dsv4_pool_quant_scatter_kernel_instances[bits - 2]; _t0<<<dim3(grid_w, batch), threads, 0, stream>>>
     (
         (const half*) stage.data_ptr(),
         (uint32_t*) pool_q.data_ptr(),

@@ -10,8 +10,8 @@ __device__ inline ValIdx warp_reduce_argmax(ValIdx v)
 {
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
-        float other_val = __shfl_down_sync(0xffffffff, v.val, offset);
-        int other_idx = __shfl_down_sync(0xffffffff, v.idx, offset);
+        float other_val = __shfl_down_sync(EXL3_FULL_MASK, v.val, offset);
+        int other_idx = __shfl_down_sync(EXL3_FULL_MASK, v.idx, offset);
         if (other_val > v.val)
         {
             v.val = other_val;
@@ -45,7 +45,7 @@ __device__ inline half warp_reduce_max_h(half v)
 {
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
-        half2 other_v = __shfl_down_sync(0xffffffff, __half2half2(v), offset);
+        half2 other_v = __shfl_down_sync(EXL3_FULL_MASK, __half2half2(v), offset);
         v = __hmax(v, __low2half(other_v));
     }
     return v;
@@ -55,7 +55,7 @@ __device__ inline float warp_reduce_max_f(float v)
 {
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
-        float other_v = __shfl_down_sync(0xffffffff, v, offset);
+        float other_v = __shfl_down_sync(EXL3_FULL_MASK, v, offset);
         v = fmaxf(v, other_v);
     }
     return v;
@@ -86,7 +86,7 @@ __device__ inline float warp_reduce_sum_f(float v)
 {
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
-        float other_v = __shfl_down_sync(0xffffffff, v, offset);
+        float other_v = __shfl_down_sync(EXL3_FULL_MASK, v, offset);
         v += other_v;
     }
     return v;
@@ -98,10 +98,10 @@ __device__ inline float warp_reduce_sum_last_k(float v, int K)
     if (lane_id < (32 - K)) v = 0.0f;
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
-        float other_v = __shfl_down_sync(0xffffffff, v, offset);
+        float other_v = __shfl_down_sync(EXL3_FULL_MASK, v, offset);
         v += other_v;
     }
-    v = __shfl_sync(0xffffffffu, v, 0);
+    v = __shfl_sync(EXL3_FULL_MASK, v, 0);
     return v;
 }
 
@@ -111,10 +111,10 @@ __device__ inline float warp_reduce_sum_first_k(float v, int K)
     if (lane_id >= K) v = 0.0f;
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
-        float other_v = __shfl_down_sync(0xffffffff, v, offset);
+        float other_v = __shfl_down_sync(EXL3_FULL_MASK, v, offset);
         v += other_v;
     }
-    v = __shfl_sync(0xffffffffu, v, 0);
+    v = __shfl_sync(EXL3_FULL_MASK, v, 0);
     return v;
 }
 

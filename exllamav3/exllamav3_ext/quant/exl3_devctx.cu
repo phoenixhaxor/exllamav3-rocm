@@ -4,6 +4,7 @@
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 #include "exl3_devctx.cuh"
+#include "exl3_rdna3.cuh"
 #include "../util.h"
 #include "../util.cuh"
 
@@ -87,4 +88,5 @@ void prepare_ctx(int device)
     DevCtx::instance().get_num_sms(device);
     DevCtx::instance().get_cc(device);
     DevCtx::instance().get_locks(device);
+    exl3_rdna3_prepare(device);
 }

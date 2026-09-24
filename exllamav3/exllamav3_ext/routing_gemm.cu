@@ -63,9 +63,9 @@ void quant_a_kernel(const half* __restrict__ a, signed char* __restrict__ ahi, s
     float m = 0.0f;
     #pragma unroll
     for (int q = 0; q < 16; ++q) m = fmaxf(m, fabsf(v[q]));
-    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
-    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
-    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+    m = fmaxf(m, __shfl_xor_sync(EXL3_FULL_MASK, m, 1));
+    m = fmaxf(m, __shfl_xor_sync(EXL3_FULL_MASK, m, 2));
+    m = fmaxf(m, __shfl_xor_sync(EXL3_FULL_MASK, m, 4));
     const float scale = m > 0.0f ? m : 1.0f;
     int4 hi4, lo4;
     det_quant16(v, __fdiv_rn(DET_QMAX, scale), hi4, lo4);
@@ -294,7 +294,7 @@ void routing_gemm_det_(const at::Tensor& hidden, const at::Tensor& gate_i8, cons
     cuda_check(cudaPeekAtLastError());
 
     static bool attr[32] = {};
-    if (!attr[dev]) { cudaFuncSetAttribute(routing_gemm_i8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, RG_SMEM); attr[dev] = true; }
+    if (!attr[dev]) { cudaFuncSetAttribute((const void*) routing_gemm_i8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, RG_SMEM); attr[dev] = true; }
     dim3 grid(CEIL_DIVIDE(E, RG_BN), CEIL_DIVIDE(R, RG_BM), S_eff);
     const signed char* bhi = (const signed char*) gate_i8.data_ptr();
     const signed char* blo = bhi + (size_t) E * K;
@@ -335,7 +335,7 @@ void quant_gate_kernel(const half* __restrict__ w, signed char* __restrict__ hi,
     for (int k = threadIdx.x; k < K; k += 256) m = fmaxf(m, fabsf(__half2float(w[(size_t) row * K + k])));
     __shared__ float red[8];
     #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(EXL3_FULL_MASK, m, o));
     if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = m;
     __syncthreads();
     m = red[0];

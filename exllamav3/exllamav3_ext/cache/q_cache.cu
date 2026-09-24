@@ -41,7 +41,7 @@ void quant_cache_cont
     TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
 
     int num_blocks = CEIL_DIVIDE(bsz, MAX_WARPS * 4);
-    quant_cache_cont_kernel_instances[bits - 2]<<<num_blocks, MAX_WARPS * 32, 0, stream>>>
+    auto _k0 = quant_cache_cont_kernel_instances[bits - 2]; _k0<<<num_blocks, MAX_WARPS * 32, 0, stream>>>
     (
         (const half*) in.data_ptr(),
         (uint32_t*) out.data_ptr(),
@@ -76,7 +76,7 @@ void quant_cache_cont_gr
     TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
 
     int num_blocks = CEIL_DIVIDE(bsz, MAX_WARPS * 4);
-    quant_cache_cont_kernel_instances[bits - 2]<<<num_blocks, MAX_WARPS * 32, 0, stream>>>
+    auto _k1 = quant_cache_cont_kernel_instances[bits - 2]; _k1<<<num_blocks, MAX_WARPS * 32, 0, stream>>>
     (
         (const half*) in.data_ptr(),
         (uint32_t*) out.data_ptr(),
@@ -120,7 +120,7 @@ void dequant_cache_cont
     TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
 
     int num_blocks = CEIL_DIVIDE(bsz, MAX_WARPS * 4);
-    dequant_cache_cont_kernel_instances[bits - 2]<<<num_blocks, MAX_WARPS * 32, 0, stream>>>
+    auto _k2 = dequant_cache_cont_kernel_instances[bits - 2]; _k2<<<num_blocks, MAX_WARPS * 32, 0, stream>>>
     (
         (const uint32_t*) in.data_ptr(),
         (const half*) in_scales.data_ptr(),
@@ -325,7 +325,7 @@ void dequant_cache_paged
 
     TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
 
-    dequant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
+    auto _k3 = dequant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2]; _k3<<<blocks, threads, 0, stream>>>
     (
         (const uint32_t*) k_in.data_ptr(),
         (const half*) k_in_scales.data_ptr(),
@@ -413,7 +413,7 @@ void dequant_cache_paged_window
 
     TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
 
-    dequant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
+    auto _k4 = dequant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2]; _k4<<<blocks, threads, 0, stream>>>
     (
         (const uint32_t*) k_in.data_ptr(),
         (const half*) k_in_scales.data_ptr(),

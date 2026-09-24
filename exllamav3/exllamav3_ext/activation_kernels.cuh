@@ -1,4 +1,17 @@
 
+#ifdef __HIP_PLATFORM_AMD__
+// ROCM_HMAX2: half2 pair-max/min (ROCm only defines __hmax2 for bf16x2)
+#include <hip/hip_fp16.h>
+__device__ __forceinline__ __half2 __hmax2(__half2 a, __half2 b) {
+    return __halves2half2(__hmax(__low2half(a), __low2half(b)),
+                          __hmax(__high2half(a), __high2half(b)));
+}
+__device__ __forceinline__ __half2 __hmin2(__half2 a, __half2 b) {
+    return __halves2half2(__hmin(__low2half(a), __low2half(b)),
+                          __hmin(__high2half(a), __high2half(b)));
+}
+#endif
+
 __device__ inline half2 clamp_half2_to_finite(half2 v)
 {
     const half2 max_h2 = __float2half2_rn(65504.0f);

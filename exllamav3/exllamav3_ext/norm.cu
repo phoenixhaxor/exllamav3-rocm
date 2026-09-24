@@ -6,8 +6,26 @@
 #include "util.h"
 #include "util.cuh"
 
+#ifdef __HIP_PLATFORM_AMD__
+// ROCm bf16 scalar shims (ROCm hanya punya varian pair)
+__device__ __forceinline__ __hip_bfloat16 rocm_f2bf16_rn(float x) { return __float2bfloat16(x); }
+__device__ __forceinline__ __hip_bfloat16 rocm_f2bf16_rz(float x)
+{
+    unsigned u = __float_as_uint(x);
+    unsigned short r = (unsigned short)(u >> 16);          // truncate = RZ
+    if ((u & 0x7fffffffu) > 0x7f800000u) r = (unsigned short)((r & 0x8000u) | 0x7fc0u);  // NaN quiet
+    return __ushort_as_bfloat16(r);
+}
+#define __float2bfloat16_rn(x) rocm_f2bf16_rn(x)
+#define __float2bfloat16_rz(x) rocm_f2bf16_rz(x)
+#endif
+
 #define NUM_THREADS 1024
+#ifdef __HIP_PLATFORM_AMD__
+using bfloat16 = __hip_bfloat16;
+#else
 using bfloat16 = __nv_bfloat16;
+#endif
 
 template <int num_threads>
 __device__ inline float reduce(float sum, int warp_id, int lane_id)
@@ -16,14 +34,14 @@ __device__ inline float reduce(float sum, int warp_id, int lane_id)
     {
         // Shuffle to sum across lanes
         __shared__ float sums[num_threads / 32];
-        for(int offset = warpSize / 2; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
+        for(int offset = warpSize / 2; offset > 0; offset /= 2) sum += __shfl_xor_sync(EXL3_FULL_MASK, sum, offset);
         return sum;
     }
     else
     {
         // Shuffle to sum across lanes
         __shared__ float sums[num_threads / 32];
-        for(int offset = warpSize / 2; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
+        for(int offset = warpSize / 2; offset > 0; offset /= 2) sum += __shfl_xor_sync(EXL3_FULL_MASK, sum, offset);
         if (lane_id == 0) sums[warp_id] = sum;
         __syncthreads();
 
@@ -33,7 +51,7 @@ __device__ inline float reduce(float sum, int warp_id, int lane_id)
         #else
             sum = sums[lane_id];
         #endif
-        for(int offset = warpSize / 2; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
+        for(int offset = warpSize / 2; offset > 0; offset /= 2) sum += __shfl_xor_sync(EXL3_FULL_MASK, sum, offset);
 
         return sum;
     }
@@ -140,13 +158,13 @@ __device__ __forceinline__ float _sigmoid_f(float x)
 __device__ inline float reduce_dyn(float sum, int warp_id, int lane_id)
 {
     __shared__ float sums[32];
-    for (int offset = 16; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
+    for (int offset = 16; offset > 0; offset /= 2) sum += __shfl_xor_sync(EXL3_FULL_MASK, sum, offset);
     int num_warps = blockDim.x / 32;
     if (num_warps == 1) return sum;
     if (lane_id == 0) sums[warp_id] = sum;
     __syncthreads();
     sum = lane_id < num_warps ? sums[lane_id] : 0.0f;
-    for (int offset = 16; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
+    for (int offset = 16; offset > 0; offset /= 2) sum += __shfl_xor_sync(EXL3_FULL_MASK, sum, offset);
     return sum;
 }
 

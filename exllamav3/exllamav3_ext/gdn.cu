@@ -1,5 +1,13 @@
 #include <cuda_fp16.h>
+#ifdef __HIP_PLATFORM_AMD__
+#include <hip/hip_fp16.h>
+#else
+#ifdef __HIP_PLATFORM_AMD__
+#include <hip/hip_fp16.h>
+#else
 #include <cuda_fp16.hpp>
+#endif
+#endif
 #include "activation.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -10,7 +18,25 @@
 #include "gdn.cuh"
 #include <cmath>
 
+#ifdef __HIP_PLATFORM_AMD__
+// ROCm bf16 scalar shims (ROCm hanya punya varian pair)
+__device__ __forceinline__ __hip_bfloat16 rocm_f2bf16_rn(float x) { return __float2bfloat16(x); }
+__device__ __forceinline__ __hip_bfloat16 rocm_f2bf16_rz(float x)
+{
+    unsigned u = __float_as_uint(x);
+    unsigned short r = (unsigned short)(u >> 16);          // truncate = RZ
+    if ((u & 0x7fffffffu) > 0x7f800000u) r = (unsigned short)((r & 0x8000u) | 0x7fc0u);  // NaN quiet
+    return __ushort_as_bfloat16(r);
+}
+#define __float2bfloat16_rn(x) rocm_f2bf16_rn(x)
+#define __float2bfloat16_rz(x) rocm_f2bf16_rz(x)
+#endif
+
+#ifdef __HIP_PLATFORM_AMD__
+using bfloat16 = __hip_bfloat16;
+#else
 using bfloat16 = __nv_bfloat16;
+#endif
 #define MAX_K_HEADS 32
 #define MAX_V_HEADS 64
 
@@ -539,8 +565,8 @@ void cuda_recurrent_gated_delta_rule_kernel
                 #pragma unroll
                 for(int offset = 16; offset > 0; offset /= 2)
                 {
-                    sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
-                    sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+                    sumq += __shfl_xor_sync(EXL3_FULL_MASK, sumq, offset);
+                    sumk += __shfl_xor_sync(EXL3_FULL_MASK, sumk, offset);
                 }
                 if (lane == 0)
                 {
@@ -561,8 +587,8 @@ void cuda_recurrent_gated_delta_rule_kernel
                 #pragma unroll
                 for(int offset = 16; offset > 0; offset /= 2)
                 {
-                    sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
-                    sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+                    sumq += __shfl_xor_sync(EXL3_FULL_MASK, sumq, offset);
+                    sumk += __shfl_xor_sync(EXL3_FULL_MASK, sumk, offset);
                 }
 
                 q = q * rsqrtf(sumq + 1e-6f);
@@ -749,8 +775,8 @@ void cuda_recurrent_gated_delta_rule_kernel_128
         #pragma unroll
         for(int offset = 16; offset > 0; offset /= 2)
         {
-            sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
-            sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+            sumq += __shfl_xor_sync(EXL3_FULL_MASK, sumq, offset);
+            sumk += __shfl_xor_sync(EXL3_FULL_MASK, sumk, offset);
         }
         if (lane == 0)
         {
@@ -764,8 +790,8 @@ void cuda_recurrent_gated_delta_rule_kernel_128
         #pragma unroll
         for(int offset = 16; offset > 0; offset /= 2)
         {
-            sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
-            sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+            sumq += __shfl_xor_sync(EXL3_FULL_MASK, sumq, offset);
+            sumk += __shfl_xor_sync(EXL3_FULL_MASK, sumk, offset);
         }
 
         q = q * rsqrtf(sumq + 1e-6f);
@@ -1650,6 +1676,28 @@ void gdn_ba_gemv_kernel
     const half2* w2 = (const half2*) (w_t + (size_t) row * k);
 
     float sum = 0.0f;
+    #ifdef __HIP_PLATFORM_AMD__
+    if (k % 256 == 0)
+    {
+        // 16-byte loads, v_dot2_f32_f16 into four independent accumulators (the scalar loop is
+        // load-latency bound: one dependent fma chain of k / 64 steps per lane)
+        typedef _Float16 hv2 __attribute__((ext_vector_type(2)));
+        const uint4* xv = (const uint4*) x2;
+        const uint4* wv = (const uint4*) w2;
+        float s4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        #pragma unroll 4
+        for (int j = lane; j < k / 8; j += 32)
+        {
+            const uint4 a = xv[j], b = wv[j];
+            s4[0] = __builtin_amdgcn_fdot2(__builtin_bit_cast(hv2, a.x), __builtin_bit_cast(hv2, b.x), s4[0], false);
+            s4[1] = __builtin_amdgcn_fdot2(__builtin_bit_cast(hv2, a.y), __builtin_bit_cast(hv2, b.y), s4[1], false);
+            s4[2] = __builtin_amdgcn_fdot2(__builtin_bit_cast(hv2, a.z), __builtin_bit_cast(hv2, b.z), s4[2], false);
+            s4[3] = __builtin_amdgcn_fdot2(__builtin_bit_cast(hv2, a.w), __builtin_bit_cast(hv2, b.w), s4[3], false);
+        }
+        sum = (s4[0] + s4[1]) + (s4[2] + s4[3]);
+    }
+    else
+    #endif
     for (int j = lane; j < k / 2; j += 32)
     {
         float2 xf = __half22float2(x2[j]);
@@ -1659,7 +1707,7 @@ void gdn_ba_gemv_kernel
     }
 
     for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_down_sync(0xffffffff, sum, offset);
+        sum += __shfl_down_sync(EXL3_FULL_MASK, sum, offset);
 
     if (lane == 0)
     {
@@ -1742,7 +1790,7 @@ void gdn_lowrank_gemv_f_kernel
         sum = fmaf(xr[j], __half2float(wr[j]), sum);
 
     for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_down_sync(0xffffffff, sum, offset);
+        sum += __shfl_down_sync(EXL3_FULL_MASK, sum, offset);
 
     if (lane == 0)
         y[(size_t) r * n + row] = sum;

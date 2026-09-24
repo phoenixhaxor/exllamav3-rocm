@@ -176,8 +176,8 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
                             #pragma unroll
                             for (int bit = 0; bit < K; ++bit)
                             {
-                                unsigned a = __ballot_sync(0xffffffff, (b0 >> (16 - 2 * K + bit)) & 1);
-                                unsigned b = __ballot_sync(0xffffffff, (b1 >> (16 - 2 * K + bit)) & 1);
+                                unsigned a = __ballot_sync(EXL3_FULL_MASK, (b0 >> (16 - 2 * K + bit)) & 1);
+                                unsigned b = __ballot_sync(EXL3_FULL_MASK, (b1 >> (16 - 2 * K + bit)) & 1);
                                 if ((thread & 31) == 0)
                                 {
                                     int offset = (ri * K + bit) * (edges / 32) + (out / 64) * 2;

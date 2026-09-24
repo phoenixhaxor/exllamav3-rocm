@@ -1,4 +1,5 @@
 import os
+import os
 
 import torch
 
@@ -57,6 +58,8 @@ _kernel_cache = {}
 _sm_count = {}
 
 
+_rdna3_attn_enable = os.environ.get("EXL3_RDNA3_ATTN", "1") != "0"
+
 def _is_pow2(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
@@ -84,7 +87,8 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
         with torch.cuda.device(device):
             src = ASTSource(fn = fn, signature = sig, constexprs = constexprs, attrs = attrs)
             ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
-            k = ext.TritonKernel(ck.asm["cubin"], ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
+            binary = ck.asm["hsaco"] if torch.version.hip else ck.asm["cubin"]
+            k = ext.TritonKernel(binary, ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
         _kernel_cache[key] = k
     return k
 
@@ -276,7 +280,7 @@ class BCAttn:
         qh, kvh = self.num_q_heads, self.num_kv_heads
         group_size = qh // kvh
 
-        block_n = max(16, 8192 // hd_pad)
+        block_n = int(os.environ.get("EXL3_ATTN_BLOCK_N", 0)) or max(16, 8192 // hd_pad)
         block_m = triton.next_power_of_2(q_len)
         block_h = max(16 // block_m, 1)
         block_rows = block_m * block_h
@@ -285,8 +289,8 @@ class BCAttn:
 
         # The live split count and split length are runtime kernel arguments derived from the
         # block-table bound per call (patched into the graph); the grid is sized to the cap
-        target = 2 * _get_sm_count(dev)
-        splits_cap = max(1, min(target // programs, 128))
+        target = int(os.environ.get("EXL3_ATTN_SPLIT_MULT", 2)) * _get_sm_count(dev)
+        splits_cap = max(1, min(target // programs, int(os.environ.get("EXL3_ATTN_SPLIT_CAP", 128))))
         window_left, window_right = _normalize_window(self.window_size)
 
         cache_t = "*i32" if self.quant else "*fp16"
@@ -309,7 +313,23 @@ class BCAttn:
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
-        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, 4, 2)
+        k_split = None
+        if torch.version.hip and _rdna3_attn_enable:
+            # HIP flash-decoding split kernel: same arguments and partial layout as the Triton
+            # kernel (combine unchanged). Covers the plain causal full-attention case
+            kb, vb = (self.k_bits, self.v_bits) if self.quant else (0, 0)
+            if (
+                causal and window_left < 0 and window_right < 0 and not self.softcap and
+                self.sinks is None and q_len <= 16 and block_rows == 16 and hd in (128, 256) and
+                kb == vb and kb in (0, 8) and abs(float(self.sm_scale) - hd ** -0.5) < 1e-6
+            ):
+                k_split = ext.rdna3_attn_split_kernel(kb, hd, q_len, kvh, group_size)
+            if k_split is not None:
+                block_n = 32
+                splits_cap = max(1, min(int(os.environ.get("EXL3_RDNA3_ATTN_SPLIT_MULT", 16)) * _get_sm_count(dev) // programs, 128))
+        if k_split is None:
+            k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts,
+                                      int(os.environ.get("EXL3_ATTN_WARPS", 4)), int(os.environ.get("EXL3_ATTN_STAGES", 2)))
 
         sig_c = {
             "partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",

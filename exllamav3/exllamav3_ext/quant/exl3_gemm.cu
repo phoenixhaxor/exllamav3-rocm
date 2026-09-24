@@ -14,6 +14,7 @@ namespace cg = cooperative_groups;
 #include "exl3_gemv.cuh"
 #include "exl3_gemv_int8.cuh"
 #include "coop_autotune.cuh"
+#include "exl3_rdna3.cuh"
 #include <set>
 #include <vector>
 
@@ -182,6 +183,14 @@ int exl3_gemm_gr
     if (mcg) cb = 1;
     if (mul1) cb = 2;
 
+    // AMD RDNA3: dedicated small-m kernel (the NVIDIA GEMV/GEMM paths rely on mma.sync / cp.async)
+    #ifdef __HIP_PLATFORM_AMD__
+    if (force_shape_idx <= 0 && force_num_sms <= 0 &&
+        exl3_rdna3_gemm(A_ptr, B_ptr, C_ptr, size_m, size_k, size_n, K, half_k, cb, c_fp32,
+                        suh_ptr, svh_ptr, device, stream, graph))
+        return 91;
+    #endif
+
     // Experimental fused int8-activation GEMV path (EXL3_INT8_GEMV=1) for mul1 tensors. Rows are
     // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
     // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
@@ -296,7 +305,7 @@ int exl3_gemm_gr
     // Launch
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
         kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
     }
@@ -658,7 +667,7 @@ int exl3_mgemm_gr
     // Launch
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
         kernel_attr_set[device].insert((void*) kernel);
     }
 

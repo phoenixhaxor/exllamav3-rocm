@@ -10,3 +10,13 @@ dist
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
+
+# ROCm build: hipify output and extension builds
+*.hip
+*_hip.cuh
+*_hip.cpp
+*_hip.h
+exllamav3/exllamav3_ext/hip_drv.*
+exllamav3/exllamav3_ext/hip_host.*
+*.so
+build/

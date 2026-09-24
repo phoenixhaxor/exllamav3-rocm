@@ -96,7 +96,7 @@ void hc_mix_partials_kernel
     {
         float v = acc[k];
         for (int offset = 16; offset > 0; offset >>= 1)
-            v += __shfl_down_sync(0xffffffffu, v, offset);
+            v += __shfl_down_sync(EXL3_FULL_MASK, v, offset);
         if (lane == 0) red[warp][k] = v;
     }
     __syncthreads();
@@ -188,7 +188,7 @@ void hc_mix_finalize_kernel
 
         if (threadIdx.x < H * H)
         {
-            const unsigned mask = (H * H == 32) ? 0xffffffffu : ((1u << (H * H)) - 1u);
+            const unsigned long long mask = (H * H == 32) ? 0xffffffffull : ((1ull << (H * H)) - 1u);
             float v = fmaf(mix_s[2 * H + threadIdx.x] * rmr, scale[2], base[2 * H + threadIdx.x]);
 
             // softmax over rows
@@ -342,7 +342,7 @@ void gr_dots_kernel
             }
         }
         for (int offset = 16; offset > 0; offset >>= 1)
-            a += __shfl_down_sync(0xffffffffu, a, offset);
+            a += __shfl_down_sync(EXL3_FULL_MASK, a, offset);
         if (lane == 0) red[h][warp] = a;
     }
     __syncthreads();
@@ -437,10 +437,10 @@ void gr_finalize_kernel
         for (int h = 0; h < H; ++h)
             for (int offset = 16; offset > 0; offset >>= 1)
             {
-                g[h].x += __shfl_xor_sync(0xffffffffu, g[h].x, offset);
-                g[h].y += __shfl_xor_sync(0xffffffffu, g[h].y, offset);
-                g[h].z += __shfl_xor_sync(0xffffffffu, g[h].z, offset);
-                g[h].w += __shfl_xor_sync(0xffffffffu, g[h].w, offset);
+                g[h].x += __shfl_xor_sync(EXL3_FULL_MASK, g[h].x, offset);
+                g[h].y += __shfl_xor_sync(EXL3_FULL_MASK, g[h].y, offset);
+                g[h].z += __shfl_xor_sync(EXL3_FULL_MASK, g[h].z, offset);
+                g[h].w += __shfl_xor_sync(EXL3_FULL_MASK, g[h].w, offset);
             }
         if (lane != 0) continue;
         float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -546,7 +546,7 @@ __device__ __forceinline__ void gr_dots_block
                 for (int jj = 0; jj < GR_J; ++jj)
                 {
                     float a = acc[q][jj];
-                    for (int offset = 16; offset > 0; offset >>= 1) a += __shfl_down_sync(0xffffffffu, a, offset);
+                    for (int offset = 16; offset > 0; offset >>= 1) a += __shfl_down_sync(EXL3_FULL_MASK, a, offset);
                     if (lane == 0 && r0 + q < R && j0 + jj < M) dots[((size_t) (r0 + q) * (M + 1) + j0 + jj) * H + h] = a;
                 }
         }
@@ -563,7 +563,7 @@ __device__ __forceinline__ void gr_dots_block
                 float4 s = s4[c];
                 a = fmaf(s.x, s.x, fmaf(s.y, s.y, fmaf(s.z, s.z, fmaf(s.w, s.w, a))));
             }
-            for (int offset = 16; offset > 0; offset >>= 1) a += __shfl_down_sync(0xffffffffu, a, offset);
+            for (int offset = 16; offset > 0; offset >>= 1) a += __shfl_down_sync(EXL3_FULL_MASK, a, offset);
             if (lane == 0) dots[((size_t) r * (M + 1) + M) * H + h] = a;
         }
     }
@@ -663,10 +663,10 @@ __device__ __forceinline__ void gr_finalize_block
             for (int h = 0; h < H; ++h)
                 for (int offset = 16; offset > 0; offset >>= 1)
                 {
-                    g[q][h].x += __shfl_xor_sync(0xffffffffu, g[q][h].x, offset);
-                    g[q][h].y += __shfl_xor_sync(0xffffffffu, g[q][h].y, offset);
-                    g[q][h].z += __shfl_xor_sync(0xffffffffu, g[q][h].z, offset);
-                    g[q][h].w += __shfl_xor_sync(0xffffffffu, g[q][h].w, offset);
+                    g[q][h].x += __shfl_xor_sync(EXL3_FULL_MASK, g[q][h].x, offset);
+                    g[q][h].y += __shfl_xor_sync(EXL3_FULL_MASK, g[q][h].y, offset);
+                    g[q][h].z += __shfl_xor_sync(EXL3_FULL_MASK, g[q][h].z, offset);
+                    g[q][h].w += __shfl_xor_sync(EXL3_FULL_MASK, g[q][h].w, offset);
                 }
         if (lane != 0) continue;
         #pragma unroll
@@ -864,8 +864,7 @@ static void hc_mix_launch
     {
         if (fn_half)
             hc_mix_partials_kernel<4, 24, half><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(half));
-        else
-            hc_mix_partials_kernel<4, 24, float><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(float));
+        else { hc_mix_partials_kernel<4, 24, float><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(float)); }
         cuda_check(cudaPeekAtLastError());
         float* post_p = (float*) post->data_ptr();
         float* comb_p = (float*) comb->data_ptr();
@@ -878,8 +877,7 @@ static void hc_mix_launch
     {
         if (fn_half)
             hc_mix_partials_kernel<4, 4, half><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(half));
-        else
-            hc_mix_partials_kernel<4, 4, float><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(float));
+        else { hc_mix_partials_kernel<4, 4, float><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(float)); }
         cuda_check(cudaPeekAtLastError());
         if (half_out)
             hc_mix_finalize_kernel<4, 4, true, true><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(nullptr, nullptr));
@@ -1068,9 +1066,9 @@ void gr_mix
         const bool hout = mixed.dtype() == at::kHalf;
         switch (nit)
         {
-            case 5:  if (hout) gr_finalize_kernel2<4, true, 5><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); else gr_finalize_kernel2<4, false, 5><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); break;
-            case 8:  if (hout) gr_finalize_kernel2<4, true, 8><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); else gr_finalize_kernel2<4, false, 8><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); break;
-            case 16: if (hout) gr_finalize_kernel2<4, true, 16><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); else gr_finalize_kernel2<4, false, 16><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); break;
+            case 5:  if (hout) { gr_finalize_kernel2<4, true, 5><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); } else { gr_finalize_kernel2<4, false, 5><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); } break;
+            case 8:  if (hout) { gr_finalize_kernel2<4, true, 8><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); } else { gr_finalize_kernel2<4, false, 8><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); } break;
+            case 16: if (hout) { gr_finalize_kernel2<4, true, 16><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); } else { gr_finalize_kernel2<4, false, 16><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); } break;
         }
         #undef ARGS2
         cuda_check(cudaPeekAtLastError());
@@ -1100,8 +1098,7 @@ void gr_mix
         post_p, mixed.data_ptr(), D, LR, chunk_cols, (float) rms_eps
     if (mixed.dtype() == at::kHalf)
         gr_finalize_kernel<4, true><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS);
-    else
-        gr_finalize_kernel<4, false><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS);
+    else { gr_finalize_kernel<4, false><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS); }
     #undef ARGS
     cuda_check(cudaPeekAtLastError());
 }

@@ -92,8 +92,8 @@ inline __device__ ValIdx fs_warp_reduce_argmax_first(ValIdx v)
 {
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
-        float other_val = __shfl_down_sync(0xffffffff, v.val, offset);
-        int other_idx = __shfl_down_sync(0xffffffff, v.idx, offset);
+        float other_val = __shfl_down_sync(EXL3_FULL_MASK, v.val, offset);
+        int other_idx = __shfl_down_sync(EXL3_FULL_MASK, v.idx, offset);
         fs_amax_first(v, other_val, other_idx);
     }
     return v;

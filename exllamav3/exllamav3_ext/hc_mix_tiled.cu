@@ -126,9 +126,9 @@ void gr_dots_i8
         float m = 0.0f;
         #pragma unroll
         for (int q = 0; q < 16; ++q) m = fmaxf(m, fabsf(v[q]));
-        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
-        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
-        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+        m = fmaxf(m, __shfl_xor_sync(EXL3_FULL_MASK, m, 1));
+        m = fmaxf(m, __shfl_xor_sync(EXL3_FULL_MASK, m, 2));
+        m = fmaxf(m, __shfl_xor_sync(EXL3_FULL_MASK, m, 4));
         const float scale = m > 0.0f ? m : 1.0f;
         int4 hi4, lo4;
         det_quant16(v, __fdiv_rn(DET_QMAX, scale), hi4, lo4);
@@ -234,9 +234,9 @@ void gr_dots_i8
         if (n0 + j < Mpad) out[(size_t) (r0 + i) * Mpad + n0 + j] = __fmul_rn(cs_[i][j], psb[n0 + j]);
     }
     // Row sum of squares over this slice: the 8 consecutive lanes of a row, fixed-order tree
-    ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 1));
-    ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 2));
-    ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 4));
+    ss = __fadd_rn(ss, __shfl_xor_sync(EXL3_FULL_MASK, ss, 1));
+    ss = __fadd_rn(ss, __shfl_xor_sync(EXL3_FULL_MASK, ss, 2));
+    ss = __fadd_rn(ss, __shfl_xor_sync(EXL3_FULL_MASK, ss, 4));
     if ((t % 8) == 0 && blockIdx.x == 0) ss_part[(size_t) slice * Rpad + r0 + a_row] = ss;
 }
 
@@ -283,7 +283,7 @@ void gr_latent_i8
     // 64-wide chunk max: two warps per chunk
     float m = fabsf(tv);
     #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(EXL3_FULL_MASK, m, o));
     if ((j & 31) == 0) wmax[j / 32] = m;
     __syncthreads();
     if (j < LR)
@@ -557,8 +557,8 @@ void gr_mix_tiled
     static bool attr[32] = {};
     if (!attr[dev])
     {
-        cudaFuncSetAttribute(gr_dots_i8, cudaFuncAttributeMaxDynamicSharedMemorySize, DOTS_SMEM);
-        cudaFuncSetAttribute(gr_gate_i8, cudaFuncAttributeMaxDynamicSharedMemorySize, GATE_SMEM);
+        cudaFuncSetAttribute((const void*) gr_dots_i8, cudaFuncAttributeMaxDynamicSharedMemorySize, DOTS_SMEM);
+        cudaFuncSetAttribute((const void*) gr_gate_i8, cudaFuncAttributeMaxDynamicSharedMemorySize, GATE_SMEM);
         attr[dev] = true;
     }
 

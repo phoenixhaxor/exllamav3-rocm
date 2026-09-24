@@ -117,6 +117,8 @@ else:
 
     if torch.version.hip:
         extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
+        _nvcc_only = {"--use_fast_math", "-Xcudafe", "--diag_suppress=177", "--diag_suppress=20012"}
+        extra_cuda_cflags = [f for f in extra_cuda_cflags if f not in _nvcc_only]
 
     if verbose:
         extra_cuda_cflags += ["--ptxas-options=-v"]

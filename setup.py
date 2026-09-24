@@ -37,7 +37,7 @@ if windows:
         extra_cflags += ["/Zi"]
         extra_cuda_cflags += []
 else:
-    extra_cflags += ["-Ofast"]
+    extra_cflags += ["-Ofast", "-Wno-register"]
     extra_cuda_cflags += []
     if ext_debug:
         extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
@@ -47,7 +47,9 @@ if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
     extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
 
 if torch and torch_version.hip:
-    extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
+    extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF", "-mno-wavefrontsize64"]
+    _nvcc_only = {"--use_fast_math", "-Xcudafe", "--diag_suppress=177", "--diag_suppress=20012"}
+    extra_cuda_cflags = [f for f in extra_cuda_cflags if f not in _nvcc_only]
 
 extra_compile_args = {
     "cxx": extra_cflags,

@@ -2,6 +2,15 @@
 
 #include <cuda.h>
 
+#ifdef __HIP_PLATFORM_AMD__
+// ROCm: driver-API aliases (hipify tidak mengkonversi cuGraph*)
+#ifndef PHX_DRV_ALIAS
+#define PHX_DRV_ALIAS 1
+#define cuGraphKernelNodeGetParams hipGraphKernelNodeGetParams
+#define cuGraphExecKernelNodeSetParams hipGraphExecKernelNodeSetParams
+#endif
+#endif
+
 // CUDA driver API entry points, resolved at runtime from the driver library so the extension
 // never links against libcuda (only the runtime is needed at build time). Symbol names are
 // stringified after macro expansion, so versioned entry points (cuGraphKernelNodeGetParams_v2

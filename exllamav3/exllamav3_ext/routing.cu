@@ -50,18 +50,18 @@ void warp_reduce_best_f32(float& key, float& payload, int& idx)
         // winner's values from the lowest tied lane
         unsigned int ku = __float_as_uint(key);
         ku = (ku & 0x80000000u) ? ~ku : (ku | 0x80000000u);
-        unsigned int m = __reduce_max_sync(0xffffffffu, ku);
-        int src = __ffs(__ballot_sync(0xffffffffu, ku == m)) - 1;
-        key = __shfl_sync(0xffffffffu, key, src);
-        payload = __shfl_sync(0xffffffffu, payload, src);
-        idx = __shfl_sync(0xffffffffu, idx, src);
+        unsigned int m = __reduce_max_sync(EXL3_FULL_MASK, ku);
+        int src = __ffs(__ballot_sync(EXL3_FULL_MASK, ku == m)) - 1;
+        key = __shfl_sync(EXL3_FULL_MASK, key, src);
+        payload = __shfl_sync(EXL3_FULL_MASK, payload, src);
+        idx = __shfl_sync(EXL3_FULL_MASK, idx, src);
     #else
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
         {
-            float other_key = __shfl_down_sync(0xffffffffu, key, offset);
-            float other_payload = __shfl_down_sync(0xffffffffu, payload, offset);
-            int other_idx = __shfl_down_sync(0xffffffffu, idx, offset);
+            float other_key = __shfl_down_sync(EXL3_FULL_MASK, key, offset);
+            float other_payload = __shfl_down_sync(EXL3_FULL_MASK, payload, offset);
+            int other_idx = __shfl_down_sync(EXL3_FULL_MASK, idx, offset);
             if (other_key > key)
             {
                 key = other_key;
@@ -70,9 +70,9 @@ void warp_reduce_best_f32(float& key, float& payload, int& idx)
             }
         }
 
-        key = __shfl_sync(0xffffffffu, key, 0);
-        payload = __shfl_sync(0xffffffffu, payload, 0);
-        idx = __shfl_sync(0xffffffffu, idx, 0);
+        key = __shfl_sync(EXL3_FULL_MASK, key, 0);
+        payload = __shfl_sync(EXL3_FULL_MASK, payload, 0);
+        idx = __shfl_sync(EXL3_FULL_MASK, idx, 0);
     #endif
 }
 
@@ -137,7 +137,7 @@ __device__ __forceinline__
 void warp_radixsort_posf16(half& key, int& idx, int* src_lane_map)
 {
     unsigned int lane_id = threadIdx.x % 32;
-    const unsigned int active = 0xffffffffu;
+    const unsigned long long active = 0xffffffffull;
 
     unsigned int ku = __half_as_ushort(key);
 
@@ -145,16 +145,16 @@ void warp_radixsort_posf16(half& key, int& idx, int* src_lane_map)
     for (int bit = 0; bit < 15; ++bit)
     {
         unsigned int b = (ku >> bit) & 1;
-        unsigned int ones = __ballot_sync(active, b);
-        unsigned int zeros = active ^ ones;
-        int nzeros = __popc(zeros);
+        unsigned long long ones = __ballot_sync(active, b);
+        unsigned long long zeros = active ^ ones;
+        int nzeros = __popcll(zeros);
 
-        unsigned int below = (1 << lane_id) - 1;
-        int r0 = __popc(zeros & below);
-        int r1 = __popc(ones & below);
+        unsigned long long below = (1 << lane_id) - 1;
+        int r0 = __popcll(zeros & below);
+        int r1 = __popcll(ones & below);
 
         int dest = b ? (nzeros + r1) : r0;
-        int myrank = __popc(active & below);
+        int myrank = __popcll(active & below);
 
         src_lane_map[dest] = lane_id;
         __syncwarp(active);
@@ -171,7 +171,7 @@ __device__ __forceinline__
 void warp_radixsort_posf32_pl(float& key, float& payload, int& idx, int* src_lane_map)
 {
     unsigned int lane_id = threadIdx.x % 32;
-    const unsigned int active = 0xffffffffu;
+    const unsigned long long active = 0xffffffffull;
 
     unsigned int ku = __float_as_uint(key);
 
@@ -179,16 +179,16 @@ void warp_radixsort_posf32_pl(float& key, float& payload, int& idx, int* src_lan
     for (int bit = 0; bit < 31; ++bit)
     {
         unsigned int b = (ku >> bit) & 1u;
-        unsigned int ones = __ballot_sync(active, b);
-        unsigned int zeros = active ^ ones;
-        int nzeros = __popc(zeros);
+        unsigned long long ones = __ballot_sync(active, b);
+        unsigned long long zeros = active ^ ones;
+        int nzeros = __popcll(zeros);
 
-        unsigned int below = (1u << lane_id) - 1u;
-        int r0 = __popc(zeros & below);
-        int r1 = __popc(ones & below);
+        unsigned long long below = (1ull << lane_id) - 1u;
+        int r0 = __popcll(zeros & below);
+        int r1 = __popcll(ones & below);
 
         int dest = b ? (nzeros + r1) : r0;
-        int myrank = __popc(active & below);
+        int myrank = __popcll(active & below);
 
         src_lane_map[dest] = lane_id;
         __syncwarp(active);
@@ -234,7 +234,7 @@ void routing_gemv_kernel
     }
 
     for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        sum += __shfl_down_sync(EXL3_FULL_MASK, sum, offset);
 
     if (lane == 0)
         scores[row] = __float2half_rn(sum);
@@ -383,7 +383,7 @@ __global__ void routing_ds3_nogroup_kernel
 
         float minv = v;
         for (int offset = 32 >> 1; offset > 0; offset >>= 1)
-            minv = fminf(minv, __shfl_down_sync(0xffffffff, minv, offset));
+            minv = fminf(minv, __shfl_down_sync(EXL3_FULL_MASK, minv, offset));
         if (lane_id == 0)
             reduce[warp_id] = minv;
 
@@ -393,7 +393,7 @@ __global__ void routing_ds3_nogroup_kernel
         {
             minv = lane_id < num_warps ? reduce[lane_id] : 1e30;
             for (int offset = 32 >> 1; offset > 0; offset >>= 1)
-                minv = fminf(minv, __shfl_down_sync(0xffffffff, minv, offset));
+                minv = fminf(minv, __shfl_down_sync(EXL3_FULL_MASK, minv, offset));
             if (lane_id == 0)
                 reduce[0] = minv;
         }
@@ -494,14 +494,14 @@ __global__ void routing_std_topk_kernel
     // Max logit for a stable softmax
     float max_logit = logit;
     max_logit = warp_reduce_max_f(max_logit);
-    max_logit = __shfl_sync(0xffffffffu, max_logit, 0);
+    max_logit = __shfl_sync(EXL3_FULL_MASK, max_logit, 0);
     if (num_warps > 1)
     {
         if (lane_id == 0) max_red[warp_id] = max_logit;
         __syncthreads();
         max_logit = lane_id < num_warps ? max_red[lane_id] : -1.0e30f;
         max_logit = warp_reduce_max_f(max_logit);
-        max_logit = __shfl_sync(0xffffffffu, max_logit, 0);
+        max_logit = __shfl_sync(EXL3_FULL_MASK, max_logit, 0);
     }
     __syncthreads();
 
@@ -559,7 +559,7 @@ __global__ void routing_std_kernel
 
     half max_logit = t < num_experts ? scores[t] : __ushort_as_half(0xfbff);
     max_logit = warp_reduce_max_h(max_logit);
-    max_logit = __shfl_sync(0xffffffffu, max_logit, 0);
+    max_logit = __shfl_sync(EXL3_FULL_MASK, max_logit, 0);
 
     if (num_warps > 1)
     {
@@ -567,7 +567,7 @@ __global__ void routing_std_kernel
         __syncthreads();
         max_logit = lane_id < num_warps ? max_red[lane_id] : __ushort_as_half(0xfbff);
         max_logit = warp_reduce_max_h(max_logit);
-        max_logit = __shfl_sync(0xffffffffu, max_logit, 0);
+        max_logit = __shfl_sync(EXL3_FULL_MASK, max_logit, 0);
         // max_red aliases sh_v: no warp may start writing its top-K into sh_v below until every
         // warp has finished reading the reduction slots
         __syncthreads();

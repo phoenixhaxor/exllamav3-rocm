@@ -1,6 +1,9 @@
 #pragma once
+#include "util.cuh"
 #include <cuda_fp16.h>
+#ifndef __HIP_PLATFORM_AMD__
 #include <mma.h>
+#endif
 
 /*
 
@@ -23,6 +26,8 @@ deterministic kernels use exp_det (range reduction + polynomial, FMAs only) and 
 rounded __fsqrt_rn / __fdiv_rn, whose results are unique by definition.
 
 */
+
+#include "ptx.cuh"
 
 #define DET_QMAX 16319.0f          // |q| <= 16319 keeps hi in [-128, 127] with the shifted split
 #define DET_I8_LDS 80
@@ -58,6 +63,31 @@ __device__ __forceinline__ void det_quant16(const float* v, float inv, int4& hi4
     lo4 = make_int4(pl[0], pl[1], pl[2], pl[3]);
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+__device__ __forceinline__ void det_mma_s8(int* c, const unsigned* a, const unsigned* b)
+{
+    // ROCm emulasi m16n8k32 s8 (PTX lane map: r=lane>>2, cc=lane&3)
+    unsigned lane = rocm_lane(); int r = lane >> 2, cc = lane & 3;
+    int acc0 = c[0], acc1 = c[1], acc2 = c[2], acc3 = c[3];
+    #pragma unroll
+    for (int t = 0; t < 4; ++t)
+    {
+        unsigned ar0 = __shfl_sync(EXL3_FULL_MASK, a[0], 4 * r + t);
+        unsigned ar1 = __shfl_sync(EXL3_FULL_MASK, a[1], 4 * r + t);
+        unsigned ar2 = __shfl_sync(EXL3_FULL_MASK, a[2], 4 * r + t);
+        unsigned ar3 = __shfl_sync(EXL3_FULL_MASK, a[3], 4 * r + t);
+        unsigned b00 = __shfl_sync(EXL3_FULL_MASK, b[0], 8 * cc + t);
+        unsigned b01 = __shfl_sync(EXL3_FULL_MASK, b[1], 8 * cc + t);
+        unsigned b10 = __shfl_sync(EXL3_FULL_MASK, b[0], 8 * cc + 4 + t);
+        unsigned b11 = __shfl_sync(EXL3_FULL_MASK, b[1], 8 * cc + 4 + t);
+        acc0 += rocm_dp4a_(ar0, b00, 0) + rocm_dp4a_(ar2, b01, 0);
+        acc1 += rocm_dp4a_(ar0, b10, 0) + rocm_dp4a_(ar2, b11, 0);
+        acc2 += rocm_dp4a_(ar1, b00, 0) + rocm_dp4a_(ar3, b01, 0);
+        acc3 += rocm_dp4a_(ar1, b10, 0) + rocm_dp4a_(ar3, b11, 0);
+    }
+    c[0] = acc0; c[1] = acc1; c[2] = acc2; c[3] = acc3;
+}
+#else
 __device__ __forceinline__ void det_mma_s8(int* c, const unsigned* a, const unsigned* b)
 {
     asm volatile(
@@ -65,6 +95,7 @@ __device__ __forceinline__ void det_mma_s8(int* c, const unsigned* a, const unsi
         : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
+#endif
 
 // One k32 step of the three-pass product for a 16 x 8 tile: hh += A_hi B_hi; x += A_hi B_lo + A_lo B_hi
 __device__ __forceinline__ void det_mma3(int* acc_hh, int* acc_x, const unsigned* ah, const unsigned* al, const unsigned* bh, const unsigned* bl)
@@ -85,7 +116,22 @@ __device__ __forceinline__ float det_flush(int hh, int x, float scale, float acc
     return __fmaf_rn(sum, scale, acc);
 }
 
-__device__ __forceinline__ unsigned det_smem_u32(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
+__device__ __forceinline__ unsigned det_smem_u32(const void* p) { return rocm_g2s(p); }
+#ifdef __HIP_PLATFORM_AMD__
+__device__ __forceinline__ void det_cp_async16(unsigned dst, const void* src, int src_bytes)
+{
+    char* d = (char*) rocm_sh_ptr(dst);
+    unsigned char tmp[16];
+    for (int i = 0; i < 16; ++i) tmp[i] = i < src_bytes ? ((const unsigned char*) src)[i] : 0;
+    *(uint4*) d = *(const uint4*) tmp;
+}
+__device__ __forceinline__ void det_cp_async_commit() { }
+template <int N> __device__ __forceinline__ void det_cp_async_wait() { __syncthreads(); }
+__device__ __forceinline__ void det_ldmatrix_x4(unsigned* r, unsigned addr)
+{
+    rocm_ldsm4(r, rocm_sh_ptr(addr));
+}
+#else
 __device__ __forceinline__ void det_cp_async16(unsigned dst, const void* src, int src_bytes)
 {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dst), "l"(src), "r"(src_bytes));
@@ -97,6 +143,7 @@ __device__ __forceinline__ void det_ldmatrix_x4(unsigned* r, unsigned addr)
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
 }
+#endif
 // Byte offset of 16-byte piece c (0..7) of row r in a dense 128-byte-row int8 tile, XOR-swizzled
 // so that both 16-byte async stores and ldmatrix fragment loads are bank-conflict free
 __device__ __forceinline__ int det_swz8(int r, int c) { return r * 128 + ((c ^ (r & 7)) << 4); }

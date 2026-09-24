@@ -37,17 +37,17 @@ void reconstruct_tile
     __syncthreads();
 
     // Dequant
-    register FragB frag[2];
+ FragB frag[2];
     dq_dispatch<K, cb, HALF>(s_packed[warp_id], lane_id * 8, frag[0], frag[1]);
 
     // Shuffle from tensor core layout to row major tile
 //    __shared__ half tile[16 * 8 * 16];
     __shared__ half2 tile[16][8][8];
 
-    half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
-    half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
-    half2 n2 = __shfl_down_sync(0xFFFFFFFF, frag[1][0], 4, 32);
-    half2 n3 = __shfl_down_sync(0xFFFFFFFF, frag[1][1], 4, 32);
+    half2 n0 = __shfl_down_sync(EXL3_FULL_MASK, frag[0][0], 4, 32);
+    half2 n1 = __shfl_down_sync(EXL3_FULL_MASK, frag[0][1], 4, 32);
+    half2 n2 = __shfl_down_sync(EXL3_FULL_MASK, frag[1][0], 4, 32);
+    half2 n3 = __shfl_down_sync(EXL3_FULL_MASK, frag[1][1], 4, 32);
 
     if (!(lane_id & 4))
     {
@@ -186,7 +186,7 @@ void reconstruct_slice
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    reconstruct_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
+    auto _t0 = reconstruct_kernel_instances[cbi]; _t0<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr(),
@@ -253,13 +253,13 @@ void reconstruct_had_tile
     {
         int j = (warp_id / 8) * (8 / (RH_THREADS / 256)) + jj;
         int wn = warp_id % 8;
-        register FragB frag[2];
+ FragB frag[2];
         dq_dispatch<K, cb, HALF>(s_packed[j][wn], lane_id * 8, frag[0], frag[1]);
 
-        half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
-        half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
-        half2 n2 = __shfl_down_sync(0xFFFFFFFF, frag[1][0], 4, 32);
-        half2 n3 = __shfl_down_sync(0xFFFFFFFF, frag[1][1], 4, 32);
+        half2 n0 = __shfl_down_sync(EXL3_FULL_MASK, frag[0][0], 4, 32);
+        half2 n1 = __shfl_down_sync(EXL3_FULL_MASK, frag[0][1], 4, 32);
+        half2 n2 = __shfl_down_sync(EXL3_FULL_MASK, frag[1][0], 4, 32);
+        half2 n3 = __shfl_down_sync(EXL3_FULL_MASK, frag[1][1], 4, 32);
 
         if (!(lane_id & 4))
         {
@@ -477,7 +477,7 @@ void reconstruct_had_slice
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_had_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    reconstruct_had_kernel_instances[cbi]<<<gridDim, RH_THREADS, 0, stream>>>
+    auto _t1 = reconstruct_had_kernel_instances[cbi]; _t1<<<gridDim, RH_THREADS, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr(),
@@ -556,7 +556,7 @@ void reconstruct_had_batch
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_had_batch_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    reconstruct_had_batch_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
+    auto _t2 = reconstruct_had_batch_kernel_instances[cbi]; _t2<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t* const*) packed_ptrs.data_ptr(),
@@ -615,7 +615,7 @@ void reconstruct_batch
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_batch_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    reconstruct_batch_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
+    auto _t3 = reconstruct_batch_kernel_instances[cbi]; _t3<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t* const*) packed_ptrs.data_ptr(),

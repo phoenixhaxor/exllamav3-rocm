@@ -44,11 +44,11 @@ __host__ __device__ constexpr int qt_min_blocks(int K, int arch)
 __device__ __forceinline__ uint32_t qt_warp_min(uint32_t value)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    return __reduce_min_sync(0xffffffff, value);
+    return __reduce_min_sync(EXL3_FULL_MASK, value);
 #else
     #pragma unroll
     for (int offset = 16; offset; offset >>= 1)
-        value = min(value, __shfl_xor_sync(0xffffffff, value, offset));
+        value = min(value, __shfl_xor_sync(EXL3_FULL_MASK, value, offset));
     return value;
 #endif
 }

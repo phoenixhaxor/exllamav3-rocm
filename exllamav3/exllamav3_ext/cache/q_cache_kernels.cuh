@@ -45,8 +45,8 @@ __device__ __forceinline__ void had_8_subgroup(float& v0, float& v1, float& v2, 
     {
         uint64_t p01 = ((uint64_t) __float_as_uint(v0)) | (((uint64_t) __float_as_uint(v1)) << 32);
         uint64_t p23 = ((uint64_t) __float_as_uint(v2)) | (((uint64_t) __float_as_uint(v3)) << 32);
-        p01 = __shfl_xor_sync(0xffffffff, p01, i);
-        p23 = __shfl_xor_sync(0xffffffff, p23, i);
+        p01 = __shfl_xor_sync(EXL3_FULL_MASK, p01, i);
+        p23 = __shfl_xor_sync(EXL3_FULL_MASK, p23, i);
         uint32_t sfm = (uint32_t) (-(int32_t)(lane & i) >> 31) & 0x80000000u;
         v0 = __uint_as_float(__float_as_uint(v0) ^ sfm) + __uint_as_float((uint32_t) p01);
         v1 = __uint_as_float(__float_as_uint(v1) ^ sfm) + __uint_as_float((uint32_t) (p01 >> 32));
@@ -71,7 +71,7 @@ __device__ __forceinline__ void quant_block_x4
 {
     constexpr int m = 1 << (num_bits - 1);
     constexpr float mf = (float) m;
-    constexpr uint32_t qmax = (1u << num_bits) - 1;
+    constexpr uint32_t qmax = (1ull << num_bits) - 1;
 
     const int lane = threadIdx.x & 31;
     const int sg = lane >> 3;
@@ -103,7 +103,7 @@ __device__ __forceinline__ void quant_block_x4
     float s = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3))) + 1e-10f;
     #pragma unroll
     for (int i = 1; i < 8; i <<= 1)
-        s = fmaxf(s, __shfl_xor_sync(0xffffffff, s, i));
+        s = fmaxf(s, __shfl_xor_sync(EXL3_FULL_MASK, s, i));
     float inv_s = 1.0f / s;
 
     // Quantize
@@ -150,7 +150,7 @@ __device__ __forceinline__ void quant_block_x4
     // Write words and scales
     if (lane < 4 * num_bits && (lane / num_bits) < active_groups)
         out[lane] = sh_pack[lane];
-    float sw = __shfl_sync(0xffffffff, s, lane * 8);
+    float sw = __shfl_sync(EXL3_FULL_MASK, s, lane * 8);
     if (lane < active_groups)
         out_scales[lane] = __float2half_rn(sw);
 }
@@ -169,7 +169,7 @@ __device__ __forceinline__ void dequant_block_x4
 {
     constexpr int m = 1 << (num_bits - 1);
     constexpr float inv_mf = 1.0f / (float) (1 << (num_bits - 1));
-    constexpr uint32_t qmask = (1u << num_bits) - 1;
+    constexpr uint32_t qmask = (1ull << num_bits) - 1;
 
     const int lane = threadIdx.x & 31;
     const int sg = lane >> 3;
@@ -184,7 +184,7 @@ __device__ __forceinline__ void dequant_block_x4
         {
             int off = sl * 4 * w;
             uint32_t word = active ? (gw[word_base + (off >> 5)] >> (off & 31)) : 0;
-            uint32_t mask = (1u << w) - 1;
+            unsigned long long mask = (1ull << w) - 1;
             q0 = (q0 << w) | (word & mask);
             q1 = (q1 << w) | ((word >> w) & mask);
             q2 = (q2 << w) | ((word >> (2 * w)) & mask);
@@ -251,7 +251,7 @@ void quant_cache_cont_kernel
     int warp = threadIdx.x >> 5;
     int g0 = (blockIdx.x * MAX_WARPS + warp) * 4;
     if (g0 >= num_groups) return;
-    int active = min(4, num_groups - g0);
+    unsigned long long active = min(4, num_groups - g0);
     quant_block_x4<bits>(in + g0 * 32, out + g0 * bits, out_scales + g0, sh_pack[warp], active, compand_a);
 }
 
@@ -277,7 +277,7 @@ void dequant_cache_cont_kernel
     int warp = threadIdx.x >> 5;
     int g0 = (blockIdx.x * MAX_WARPS + warp) * 4;
     if (g0 >= num_groups) return;
-    int active = min(4, num_groups - g0);
+    unsigned long long active = min(4, num_groups - g0);
     dequant_block_x4<bits>(in + g0 * bits, in_scales + g0, out + g0 * 32, active, compand_a);
 }
 
@@ -317,7 +317,7 @@ void quant_cache_paged_kernel
     int warp = threadIdx.x >> 5;
     int g0 = (blockIdx.x * (blockDim.x >> 5) + warp) * 4;
     if (g0 >= groups_per_token) return;
-    int active = min(4, groups_per_token - g0);
+    unsigned long long active = min(4, groups_per_token - g0);
     int base = token_pos * groups_per_token + g0;
     int in_base = in_pos * groups_per_token + g0;
 
@@ -383,7 +383,7 @@ void dequant_cache_paged_kernel
         int token_idx = chunk_id / chunks_per_token;
         if (token_idx >= max_token_idx) break;
         int g0 = (chunk_id - token_idx * chunks_per_token) * 4;
-        int active = min(4, groups_per_token - g0);
+        unsigned long long active = min(4, groups_per_token - g0);
         int page_idx = token_idx / CQ_PAGE_SIZE;
         int mapped_page = b_block_table[page_idx];
         int token_pos = mapped_page * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);

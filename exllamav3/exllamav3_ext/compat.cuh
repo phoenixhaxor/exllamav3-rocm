@@ -9,7 +9,7 @@ __forceinline__ __device__ float copysignf_pos(float a, float b)
     return r;
 }
 
-#if defined(USE_ROCM) || (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 750 || CUDART_VERSION < 11000))
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__) || (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 750 || CUDART_VERSION < 11000))
 
 __inline__ __device__ float tanh_opt(float x)
 {

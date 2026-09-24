@@ -9,6 +9,16 @@
 #include "cuda_drv.h"
 #include "quant/exl3_devctx.cuh"
 
+#ifdef __HIP_PLATFORM_AMD__
+#ifndef PHX_GRAPH_ALIAS
+#define PHX_GRAPH_ALIAS 1
+#define CUgraphNode hipGraphNode_t
+#define CUgraphExec hipGraphExec_t
+#define CUresult hipError_t
+#define CUDA_SUCCESS hipSuccess
+#endif
+#endif
+
 //#define GRAPHDEBUG 1
 
 Graph::Graph()
@@ -175,7 +185,7 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
         if (!node_needs_update[n]) continue;
         if (node_is_driver[n])
         {
-            CUresult r = CudaDrv::instance().graph_exec_kernel_node_set_params((CUgraphExec) graph_exec, (CUgraphNode) nodes[n], &node_params_drv[n]);
+            CUresult r = CudaDrv::instance().graph_exec_kernel_node_set_params((CUgraphExec) graph_exec, (hipGraphNode_t) nodes[n], &node_params_drv[n]);
             TORCH_CHECK(r == CUDA_SUCCESS, "Graph node parameter update failed (driver), CUresult ", (int) r);
         }
         else
@@ -205,7 +215,11 @@ void Graph::inspect_graph()
 
         if (nodeType == cudaGraphNodeTypeKernel)
         {
+            #ifdef __HIP_PLATFORM_AMD__
+            hipKernelNodeParams nodeParams;
+#else
             cudaKernelNodeParams nodeParams;
+#endif
             cudaGraphKernelNodeGetParams(nodes[i], &nodeParams);
             std::cout << "Kernel node " << i << ":" << std::endl;
             std::cout << "  Function pointer: " << nodeParams.func << std::endl;

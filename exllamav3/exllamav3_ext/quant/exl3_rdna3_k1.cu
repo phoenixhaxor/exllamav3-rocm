@@ -1,0 +1,4 @@
+#define EXL3_RDNA3_DEFINE_HAD
+#include "exl3_rdna3_kernel.cuh"
+
+EXL3_RDNA3_GETTER_HALF(1)

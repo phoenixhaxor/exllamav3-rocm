@@ -1,3 +1,4 @@
+#include "../util.cuh"
 
 __device__ __forceinline__ void pg_barrier_inner
 (

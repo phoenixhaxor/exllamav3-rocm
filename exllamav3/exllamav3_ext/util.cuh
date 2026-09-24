@@ -1,9 +1,80 @@
 #pragma once
 
+#ifdef __HIP_PLATFORM_AMD__
+#include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
+#endif
+
+#if defined(__HIP_PLATFORM_AMD__)
+#ifndef PHX_NANOSLEEP
+#define PHX_NANOSLEEP 1
+// HIP has no __nanosleep; s_sleep N waits ~64*N clocks
+__device__ __forceinline__ void __nanosleep(unsigned ns)
+{
+#if defined(__HIP_DEVICE_COMPILE__)
+    __builtin_amdgcn_s_sleep(1);
+#endif
+}
+#endif
+#endif
+
+#ifdef __HIP_PLATFORM_AMD__
+// ROCm: __halves2half2 tak selalu terlihat di host pass libtorch TU
+__device__ __forceinline__ half2 rocm_h2(half a, half b)
+{
+    __half2 r; r.x = a; r.y = b; return r;
+}
+__device__ __forceinline__ __hip_bfloat162 rocm_bh2(__hip_bfloat16 a, __hip_bfloat16 b)
+{
+    __hip_bfloat162 r; r.x = a; r.y = b; return r;
+}
+#define __halves2half2(a, b) rocm_h2((a), (b))
+#define __halves2bfloat162(a, b) rocm_bh2((a), (b))
+#endif
+
 #include <cstdio>
+
+#ifdef __HIP_PLATFORM_AMD__
+#define EXL3_FULL_MASK 0xffffffffull
+#else
+#define EXL3_FULL_MASK 0xffffffffu
+#endif
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
+
+#ifdef __HIP_PLATFORM_AMD__
+#ifndef __align__
+#define __align__(n) __attribute__((aligned(n)))
+#endif
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
+
+// Cache-hinted loads: plain loads on AMD
+template <typename T> __device__ __forceinline__ T __ldcs(const T* p) { return *p; }
+template <typename T> __device__ __forceinline__ T __ldcg(const T* p) { return *p; }
+
+// dp4a: v_dot4_u32_u8 for the unsigned form (codebook byte sums), v_dot4_i32_iu8 for the signed form
+__device__ __forceinline__ unsigned int exl3_dp4a(unsigned int a, unsigned int b, unsigned int c)
+{
+#if defined(__HIP_DEVICE_COMPILE__)
+    return __builtin_amdgcn_udot4(a, b, c, false);
+#else
+    return 0;
+#endif
+}
+__device__ __forceinline__ int exl3_dp4a(int a, int b, int c)
+{
+#if defined(__HIP_DEVICE_COMPILE__)
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#else
+    return 0;
+#endif
+}
+#define __dp4a exl3_dp4a
+#endif
+
 
 typedef struct __align__(8) half4
 {
@@ -110,7 +181,6 @@ inline const char* cublasGetErrorString(cublasStatus_t status) {
         case CUBLAS_STATUS_EXECUTION_FAILED:  return "CUBLAS_STATUS_EXECUTION_FAILED";
         case CUBLAS_STATUS_INTERNAL_ERROR:    return "CUBLAS_STATUS_INTERNAL_ERROR";
         case CUBLAS_STATUS_NOT_SUPPORTED:     return "CUBLAS_STATUS_NOT_SUPPORTED";
-        case CUBLAS_STATUS_LICENSE_ERROR:     return "CUBLAS_STATUS_LICENSE_ERROR";
         default:                              return "Unknown cuBLAS status";
     }
 }
@@ -126,14 +196,14 @@ inline void cublas_assert(cublasStatus_t code, const char *file, int line, bool 
     }
 }
 
-__device__ inline float fxor(float v, uint32_t mask)
+__device__ inline float fxor(float v, unsigned long long mask)
 {
     uint32_t* vi = reinterpret_cast<uint32_t*>(&v);
     *vi ^= mask;
     return v;
 }
 
-__device__ inline half2 h2xor(half2 v, uint32_t mask)
+__device__ inline half2 h2xor(half2 v, unsigned long long mask)
 {
     uint32_t* vi = reinterpret_cast<uint32_t*>(&v);
     *vi ^= mask;

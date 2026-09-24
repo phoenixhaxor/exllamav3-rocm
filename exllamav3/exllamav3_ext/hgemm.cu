@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 #include "hgemm.cuh"
+#include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
@@ -98,6 +99,17 @@ void hgemm
     at::Tensor c
 )
 {
+    #ifdef __HIP_PLATFORM_AMD__
+        // rocBLAS on gfx11 has no WMMA solutions for fp16 x fp16 -> fp32 output (~16 TFLOPS vs ~80 for
+        // fp16 output), so larger products go through an fp16 result and a widening copy
+        if (c.dtype() == at::kFloat && a.dtype() == at::kHalf && a.numel() / a.size(-1) >= 64)
+        {
+            at::Tensor c16 = at::empty(c.sizes(), c.options().dtype(at::kHalf));
+            hgemm_gr(a, b, c16, nullptr);
+            c.copy_(c16);
+            return;
+        }
+    #endif
     hgemm_gr(a, b, c, nullptr);
 }
 

@@ -916,6 +916,10 @@ def _paged_attn_decode_split_kernel(
 
     n_start = split * split_len
     n_end = tl.minimum(n_start + split_len, total_k_len)
+    if WINDOW_LEFT >= 0:
+        # Sliding window: no row attends before its first query position minus the window, so
+        # skip those keys instead of loading and masking the whole context
+        n_start = tl.maximum(n_start, total_k_len - q_len - WINDOW_LEFT)
 
     m = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
     l = tl.full((BLOCK_ROWS,), 0.0, tl.float32)
@@ -1853,11 +1857,13 @@ def paged_attn_triton_prefill(
     if hd_pad <= 128:
         cfg = (128, 32, 8, 2) if blackwell else (128, 64, 8, 2)
     elif hd_pad <= 256:
-        cfg = (64, 32, 8, 2)
+        # RDNA3: 128 x 64 tiles, single stage (~57-60 vs ~23 TFLOPS for 64 x 32 x 2 on the 7900 XTX)
+        cfg = (128, 64, 8, 1) if torch.version.hip else (64, 32, 8, 2)
     else:
         cfg = (32, 16, 4, 2)
     num_stages_forced = num_stages is not None
-    block_m = block_m or cfg[0]
+    block_m = block_m or int(os.environ.get("EXL3_PF_BLOCK_M", 0)) or cfg[0]
+    num_warps = num_warps or int(os.environ.get("EXL3_PF_WARPS", 0)) or None
     block_n = block_n or cfg[1]
     num_warps = num_warps or cfg[2]
     num_stages = num_stages or cfg[3]
@@ -1869,6 +1875,7 @@ def paged_attn_triton_prefill(
         block_n = max(16, min(128, 16384 // hd_pad))
         if hd_pad >= 256 and qck + qcv >= 13 and block_n > 16:
             block_n //= 2
+    block_n = int(os.environ.get("EXL3_PF_BLOCK_N", 0)) or block_n
 
     num_pages_per_seq = block_table.shape[1]
     q_blocks = triton.cdiv(q_len, block_m)

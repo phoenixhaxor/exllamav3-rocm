@@ -1,5 +1,18 @@
 #pragma once
 #include "../compat.cuh"
+#ifdef __HIP_PLATFORM_AMD__
+// ROCM_HMAX2: half2 pair-max/min (ROCm only defines __hmax2 for bf16x2)
+#include <hip/hip_fp16.h>
+__device__ __forceinline__ __half2 __hmax2(__half2 a, __half2 b) {
+    return __halves2half2(__hmax(__low2half(a), __low2half(b)),
+                          __hmax(__high2half(a), __high2half(b)));
+}
+__device__ __forceinline__ __half2 __hmin2(__half2 a, __half2 b) {
+    return __halves2half2(__hmin(__low2half(a), __low2half(b)),
+                          __hmin(__high2half(a), __high2half(b)));
+}
+#endif
+
 
 #define ACT_SILU 0
 #define ACT_GELU 1
@@ -25,11 +38,11 @@ __device__ inline void shuffle_had_f4x32(float& h0, float& h1, float& h2, float&
         uint32_t i3 = __float_as_uint(h3);
         uint64_t h01 =  (uint64_t) i0 | (((uint64_t) i1) << 32);
         uint64_t h23 =  (uint64_t) i2 | (((uint64_t) i3) << 32);
-        uint64_t ph01 = __shfl_xor_sync(0xffffffff, h01, i);
-        uint64_t ph23 = __shfl_xor_sync(0xffffffff, h23, i);
-        float ph0 = __uint_as_float((uint32_t) (ph01 & 0xffffffff));
+        uint64_t ph01 = __shfl_xor_sync(EXL3_FULL_MASK, h01, i);
+        uint64_t ph23 = __shfl_xor_sync(EXL3_FULL_MASK, h23, i);
+        float ph0 = __uint_as_float((uint32_t) (ph01 & 0xffffffffull));
         float ph1 = __uint_as_float((uint32_t) (ph01 >> 32));
-        float ph2 = __uint_as_float((uint32_t) (ph23 & 0xffffffff));
+        float ph2 = __uint_as_float((uint32_t) (ph23 & 0xffffffffull));
         float ph3 = __uint_as_float((uint32_t) (ph23 >> 32));
         int32_t sfm = -static_cast<int32_t>(lane_id & i) >> 31;
         i0 ^= sfm & 0x80000000;
@@ -49,8 +62,8 @@ __device__ inline void shuffle_had_f2x32(float& v, float& w, const int lane_id)
     for (int i = 1; i < 32; i <<= 1)
     {
         uint64_t vw = ((uint64_t) __float_as_uint(v)) | (((uint64_t) __float_as_uint(w)) << 32);
-        uint64_t pvw = __shfl_xor_sync(0xffffffff, vw, i);
-        float pv = __uint_as_float((uint32_t) (pvw & 0xffffffff));
+        uint64_t pvw = __shfl_xor_sync(EXL3_FULL_MASK, vw, i);
+        float pv = __uint_as_float((uint32_t) (pvw & 0xffffffffull));
         float pw = __uint_as_float((uint32_t) (pvw >> 32));
         uint32_t vi = __float_as_uint(v);
         uint32_t wi = __float_as_uint(w);
@@ -66,7 +79,7 @@ __device__ inline float shuffle_had_fx32(float v, const int lane_id)
 {
     for (int i = 1; i < 32; i <<= 1)
     {
-        float pv = __shfl_xor_sync(0xffffffff, v, i);
+        float pv = __shfl_xor_sync(EXL3_FULL_MASK, v, i);
         uint32_t* vi = reinterpret_cast<uint32_t*>(&v);
         int32_t sfm = -static_cast<int16_t>(lane_id & i) >> 31;
         *vi ^= (sfm & 0x80000000);
@@ -79,7 +92,7 @@ __device__ inline half2 shuffle_had_h2x32(half2 v, int lane_id)
 {
     for (int i = 1; i < 32; i <<= 1)
     {
-        half2 pv = __shfl_xor_sync(0xffffffff, v, i);
+        half2 pv = __shfl_xor_sync(EXL3_FULL_MASK, v, i);
         uint32_t* vi = reinterpret_cast<uint32_t*>(&v);
         int32_t sfm = -static_cast<int16_t>(lane_id & i) >> 31;
         *vi ^= (sfm & 0x80008000);

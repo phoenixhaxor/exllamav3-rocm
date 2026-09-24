@@ -170,14 +170,14 @@ void dsv4_compress_windows_kernel
     // Weighted RMS norm over the hd columns
     float sq = comp * comp;
     for (int offset = 16; offset > 0; offset >>= 1)
-        sq += __shfl_down_sync(0xffffffffu, sq, offset);
+        sq += __shfl_down_sync(EXL3_FULL_MASK, sq, offset);
     if ((c % 32) == 0) sh_red[c / 32] = sq;
     __syncthreads();
     if (c < 32)
     {
         sq = c < t_warps ? sh_red[c] : 0.0f;
         for (int offset = 16; offset > 0; offset >>= 1)
-            sq += __shfl_down_sync(0xffffffffu, sq, offset);
+            sq += __shfl_down_sync(EXL3_FULL_MASK, sq, offset);
         if (c == 0) sh_red[0] = sq;
     }
     __syncthreads();

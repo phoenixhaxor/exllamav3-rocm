@@ -186,7 +186,7 @@ void quantize_tiles_frac_kernel
         }
         #pragma unroll
         for (int offset = 16; offset; offset >>= 1)
-            best = min(best, __shfl_xor_sync(0xffffffff, best, offset));
+            best = min(best, __shfl_xor_sync(EXL3_FULL_MASK, best, offset));
         if ((thread & 31) == 0)
             ((uint32_t*) sh_idx)[thread >> 5] = best;
         __syncthreads();
@@ -195,7 +195,7 @@ void quantize_tiles_frac_kernel
             best = thread < NW ? ((uint32_t*) sh_idx)[thread] : 0x7c00ffffu;
             #pragma unroll
             for (int offset = 16; offset; offset >>= 1)
-                best = min(best, __shfl_xor_sync(0xffffffff, best, offset));
+                best = min(best, __shfl_xor_sync(EXL3_FULL_MASK, best, offset));
         }
         unsigned rank = best & 65535;
         unsigned v = ((__brev(rank >> 10) >> 27) << 5) | (__brev((rank >> 5) & 31) >> 27);

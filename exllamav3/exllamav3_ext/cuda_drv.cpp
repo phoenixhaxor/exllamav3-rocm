@@ -29,8 +29,14 @@ const CudaDrv& CudaDrv::instance()
         #ifdef _WIN32
             void* lib = (void*) LoadLibraryA("nvcuda.dll");
         #else
+            #ifdef __HIP_PLATFORM_AMD__
+            void* lib = dlopen("libamdhip64.so", RTLD_NOW | RTLD_GLOBAL);
+#else
             void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
-            if (!lib) lib = dlopen("libcuda.so", RTLD_NOW | RTLD_GLOBAL);
+#endif
+            #ifndef __HIP_PLATFORM_AMD__
+        if (!lib) lib = dlopen("libcuda.so", RTLD_NOW | RTLD_GLOBAL);
+#endif
         #endif
         TORCH_CHECK(lib, "Could not load the CUDA driver library");
 

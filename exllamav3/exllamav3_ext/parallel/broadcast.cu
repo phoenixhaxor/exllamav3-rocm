@@ -10,6 +10,7 @@
 #include "ll.cuh"
 #include "barrier_inner.cuh"
 
+
 #define NUM_THREADS 1024
 #define NUM_THREADS_LL 256
 

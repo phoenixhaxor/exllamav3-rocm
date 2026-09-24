@@ -6,6 +6,14 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
 #include "util.cuh"
+// ROCM_LDCG: ROCm hanya punya __ldcg half/half2 — lengkapi float/int/uint/short
+#ifdef __HIP_PLATFORM_AMD__
+__device__ __forceinline__ float __ldcg(const float* p) { return __builtin_nontemporal_load(p); }
+__device__ __forceinline__ int __ldcg(const int* p) { return __builtin_nontemporal_load(p); }
+__device__ __forceinline__ unsigned int __ldcg(const unsigned int* p) { return __builtin_nontemporal_load(p); }
+__device__ __forceinline__ unsigned short __ldcg(const unsigned short* p) { return __builtin_nontemporal_load(p); }
+#endif
+
 
 // DFlash2 grouped dynamic causal convolution over a draft block (dflash.model
 // _grouped_dynamic_convolve):
@@ -213,7 +221,7 @@ void dflash2_selector_walk_kernel
             for (int r = lane; r < rank; r += 32)
                 dot += a_g[r] * to_f(b_row[r]);
             for (int offset = 16; offset > 0; offset /= 2)
-                dot += __shfl_xor_sync(0xffffffff, dot, offset);
+                dot += __shfl_xor_sync(EXL3_FULL_MASK, dot, offset);
             if (lane == 0) scores[c] = u_row[c] + dot;
         }
         __syncthreads();
@@ -333,14 +341,14 @@ __device__ __forceinline__ void warp_topk(float (&x)[N], int (&id)[N], float* ou
         float best = cur; int best_lane = lane;
         for (int offset = 16; offset > 0; offset /= 2)
         {
-            float o_best = __shfl_xor_sync(0xffffffff, best, offset);
-            int o_lane = __shfl_xor_sync(0xffffffff, best_lane, offset);
+            float o_best = __shfl_xor_sync(EXL3_FULL_MASK, best, offset);
+            int o_lane = __shfl_xor_sync(EXL3_FULL_MASK, best_lane, offset);
             if (o_best > best || (o_best == best && o_lane < best_lane)) { best = o_best; best_lane = o_lane; }
         }
         int best_id = -1;
         #pragma unroll
         for (int i = 0; i < N; ++i) if (i == arg) best_id = id[i];
-        best_id = __shfl_sync(0xffffffff, best_id, best_lane);
+        best_id = __shfl_sync(EXL3_FULL_MASK, best_id, best_lane);
         if (lane == 0) { out_v[k] = best; out_ix[k] = best_id; }
         if (lane == best_lane)
         {

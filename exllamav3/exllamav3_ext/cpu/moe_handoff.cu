@@ -16,6 +16,12 @@
 #else
 #include <intrin.h>
 #include <windows.h>
+
+#ifdef __HIP_PLATFORM_AMD__
+#ifndef CUDAAPI
+#define CUDAAPI
+#endif
+#endif
 #endif
 
 // Wait timeout: generous, the CPU may be chewing a full prefill chunk
@@ -42,7 +48,7 @@ __global__ void moe_flag_wait_kernel(uint32_t* flag, uint32_t value, uint32_t* a
     {
         uint32_t v = (uint32_t) ldg_acquire_sys_u32(flag);
         if ((int32_t)(v - value) >= 0) return;
-        __nanosleep(sleep);
+        { } (void) sleep;
         waited += sleep;
         if (sleep < MOE_SLEEP_MAX) sleep <<= 1;
         if (waited > MOE_WAIT_TIMEOUT_NS)
@@ -62,8 +68,17 @@ __global__ void moe_flag_wait_kernel(uint32_t* flag, uint32_t value, uint32_t* a
 // writing satisfying values into the flags.
 namespace {
 
-typedef CUresult (CUDAAPI* fn_stream_wait32)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
-typedef CUresult (CUDAAPI* fn_stream_write32)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
+#ifdef __HIP_PLATFORM_AMD__
+typedef unsigned int cuuint32_t;
+typedef hipError_t (*fn_stream_wait32)(hipStream_t, void*, cuuint32_t, unsigned int, uint32_t);
+#else
+typedef hipError_t (*fn_stream_wait32)(hipStream_t, void*, cuuint32_t, unsigned int, uint32_t);
+#endif
+#ifdef __HIP_PLATFORM_AMD__
+typedef hipError_t (*fn_stream_write32)(hipStream_t, void*, cuuint32_t, unsigned int);
+#else
+typedef hipError_t (*fn_stream_write32)(hipStream_t, void*, cuuint32_t, unsigned int);
+#endif
 
 struct MemOps
 {
@@ -75,20 +90,20 @@ struct MemOps
         // Symbol resolution is unconditional (independent of exl3_moe_cpu_set_memops): whether
         // the ops are used is a separate, mutable runtime switch, not a one-time decision
 #ifdef __linux__
-        void* h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_NOLOAD);
-        if (!h) h = dlopen("libcuda.so", RTLD_LAZY | RTLD_NOLOAD);
+        void* h = dlopen("librocr.so", RTLD_LAZY);
+        if (!h) h = dlopen("librocr.so", RTLD_LAZY);
         if (!h) return;
-        wait = (fn_stream_wait32) dlsym(h, "cuStreamWaitValue32_v2");
-        if (!wait) wait = (fn_stream_wait32) dlsym(h, "cuStreamWaitValue32");
-        write = (fn_stream_write32) dlsym(h, "cuStreamWriteValue32_v2");
-        if (!write) write = (fn_stream_write32) dlsym(h, "cuStreamWriteValue32");
+        wait = (fn_stream_wait32) dlsym(h, "hipStreamWaitValue32");
+        if (!wait) wait = (fn_stream_wait32) dlsym(h, "hipStreamWaitValue32");
+        write = (fn_stream_write32) dlsym(h, "hipStreamWriteValue32");
+        if (!write) write = (fn_stream_write32) dlsym(h, "hipStreamWriteValue32");
 #else
         HMODULE h = GetModuleHandleA("nvcuda.dll");
         if (!h) return;
-        wait = (fn_stream_wait32) GetProcAddress(h, "cuStreamWaitValue32_v2");
-        if (!wait) wait = (fn_stream_wait32) GetProcAddress(h, "cuStreamWaitValue32");
-        write = (fn_stream_write32) GetProcAddress(h, "cuStreamWriteValue32_v2");
-        if (!write) write = (fn_stream_write32) GetProcAddress(h, "cuStreamWriteValue32");
+        wait = (fn_stream_wait32) GetProcAddress(h, "hipStreamWaitValue32");
+        if (!wait) wait = (fn_stream_wait32) GetProcAddress(h, "hipStreamWaitValue32");
+        write = (fn_stream_write32) GetProcAddress(h, "hipStreamWriteValue32");
+        if (!write) write = (fn_stream_write32) GetProcAddress(h, "hipStreamWriteValue32");
 #endif
         resolved = wait && write;
     }
@@ -112,8 +127,18 @@ void exl3_moe_flag_write(uintptr_t flag, int64_t value)
     if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
         && g_memops_ok.load(std::memory_order_relaxed))
     {
-        CUresult r = m.write((CUstream) stream, (CUdeviceptr) flag, (cuuint32_t) value, 0);
+        #ifdef __HIP_PLATFORM_AMD__
+        hipError_t r2 = m.write(
+            (hipStream_t) stream,
+            (void*) flag,
+            (cuuint32_t) value,
+            0
+        );
+        if (r2 == hipSuccess) return;
+#else
+CUresult r = m.write((CUstream) stream, (CUdeviceptr) flag, (cuuint32_t) value, 0);
         if (r == CUDA_SUCCESS) return;
+#endif
         g_memops_ok.store(false, std::memory_order_relaxed);
     }
     moe_flag_write_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<uint32_t*>(flag), static_cast<uint32_t>(value));
@@ -126,6 +151,16 @@ void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
     if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
         && g_memops_ok.load(std::memory_order_relaxed))
     {
+#ifdef __HIP_PLATFORM_AMD__
+        hipError_t r = m.wait(
+            (hipStream_t) stream,
+            (void*) flag,
+            (cuuint32_t) value,
+            hipStreamWaitValueGte,
+            0xFFFFFFFFu
+        );
+        if (r == hipSuccess) return;
+#else
         CUresult r = m.wait(
             (CUstream) stream,
             (CUdeviceptr) flag,
@@ -133,6 +168,7 @@ void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
             CU_STREAM_WAIT_VALUE_GEQ
         );
         if (r == CUDA_SUCCESS) return;
+#endif
         g_memops_ok.store(false, std::memory_order_relaxed);
     }
     moe_flag_wait_kernel<<<1, 1, 0, stream>>>

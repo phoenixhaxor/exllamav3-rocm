@@ -7,6 +7,14 @@ from ..loader import SafetensorsCollection
 from ..util.file import read_dict, no_value, no_default
 import uuid
 
+
+try:
+    import torch as _torch
+    _is_hip = _torch.version.hip is not None and os.environ.get("EXL3_HIP_MGEMM", "0") == "0"
+except Exception:
+    _is_hip = False
+
+
 @dataclass
 class InferParams:
     """
@@ -59,6 +67,9 @@ class InferParams:
         self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
+        # ROCm: the fused multi-matrix kernels are NVIDIA-only; separate projections take the RDNA3 GEMM
+        if _is_hip:
+            return False
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
         # requires the mul1 codebook; other tensors always keep the fused MGEMM
         if not mul1:

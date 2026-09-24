@@ -1,5 +1,30 @@
 #pragma once
 
+// (x & 0x8fff8fff) ^ 0x3b603b60 as a single lop3 on NVIDIA
+#ifdef __HIP_PLATFORM_AMD__
+#define EXL3_LOP3_6A(x) (x) = ((x) & 0x8fff8fffu) ^ 0x3b603b60u
+#else
+#define EXL3_LOP3_6A(x) asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x))
+#endif
+#include "../util.cuh"
+
+// idx * 0x83DCD12D (mod 2^32) for a 16-bit trellis window. On RDNA the 32-bit v_mul_lo_u32 is quarter
+// rate; two full-rate 24-bit multiplies give the same product (only the low 8 bits of idx * 0x83 reach
+// the top byte)
+__device__ __forceinline__ uint32_t mul1_mul(uint32_t x)
+{
+    #if defined(__HIP_PLATFORM_AMD__) && defined(__HIP_DEVICE_COMPILE__)
+        // inline asm: LLVM otherwise folds the pair back into one v_mul_lo_u32
+        uint32_t lo, hi;
+        asm ("v_mul_u32_u24 %0, 0xdcd12d, %1" : "=v"(lo) : "v"(x));
+        asm ("v_mul_u32_u24 %0, 0x83, %1" : "=v"(hi) : "v"(x));
+        return lo + (hi << 24);
+    #else
+        return x * 0x83DCD12Du;
+    #endif
+}
+
+
 // This used to force integer MAD on sm_86 via inline asm, which outperformed the IMUL emitted by older
 // nvcc versions on the RTX 3090. As of CUDA 13.2 the workaround has inverted: the plain multiply is ~4%
 // faster end-to-end at m=1. Kept as a hook in case it regresses again.
@@ -44,8 +69,8 @@ __device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
 // Ditto mcg (cb 1)
 __device__ inline half2 decode_mcg_product_2(uint32_t x0, uint32_t x1)
 {
-    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
-    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+    EXL3_LOP3_6A(x0);
+    EXL3_LOP3_6A(x1);
     half2_uint32 xu0(x0);
     half2_uint32 xu1(x1);
     half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);
@@ -60,7 +85,7 @@ __device__ inline half decode_3inst(uint32_t x)
     {
         x *= 89226354u;
         x += 64248484u;
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
+        EXL3_LOP3_6A(x);
         half2_uint32 xu(x);
         return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
     }
@@ -69,13 +94,13 @@ __device__ inline half decode_3inst(uint32_t x)
         x *= 0xCBAC1FEDu;
         // x = mul_const_u32<0xCBAC1FEDu>(x);
 
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
+        EXL3_LOP3_6A(x);
         half2_uint32 xu(x);
         return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
     }
     if constexpr (cb == 2)
     {
-        x *= 0x83DCD12Du;
+        x = mul1_mul(x);
         const uint32_t acc = 0x6400u;  // 0x6400 -> 1024.0 ..  0x67FF -> 2047.0
         // Byte sum via dp4a, bit-identical to the previous vabsdiff4(x, 0, acc) but native on Blackwell
         // where vabsdiff4 is emulated. dp4a also wins om Ampere now, possibly after compiler changes, and ties on Ada
@@ -98,8 +123,8 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
         x1 *= 89226354u;
         x0 += 64248484u;
         x1 += 64248484u;
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+        EXL3_LOP3_6A(x0);
+        EXL3_LOP3_6A(x1);
         half2_uint32 xu0(x0);
         half2_uint32 xu1(x1);
         half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);
@@ -116,8 +141,8 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
     }
     if constexpr (cb == 2)
     {
-        x0 *= 0x83DCD12Du;
-        x1 *= 0x83DCD12Du;
+        x0 = mul1_mul(x0);
+        x1 = mul1_mul(x1);
         return decode_mul1_product_2(x0, x1);
     }
 }

@@ -59,9 +59,18 @@ namespace cg_gemv = cooperative_groups;
 
 __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c)
 {
-    int d;
-    asm ("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
-    return d;
+    #ifdef __HIP_PLATFORM_AMD__
+        // unsigned a, signed b
+        #if defined(__HIP_DEVICE_COMPILE__)
+            return __builtin_amdgcn_sudot4(false, (int) a, true, (int) b, c, false);
+        #else
+            return 0;
+        #endif
+    #else
+        int d;
+        asm ("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+        return d;
+    #endif
 }
 
 // i0/i2 land in [0, 2*words); a compare+subtract replaces the modulo (words is not a power of two for
@@ -311,8 +320,8 @@ __device__ __forceinline__ void gemv_int8_row_sums
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1)
     {
-        s1 += __shfl_xor_sync(0xffffffff, s1, o);
-        s2 += __shfl_xor_sync(0xffffffff, s2, o);
+        s1 += __shfl_xor_sync(EXL3_FULL_MASK, s1, o);
+        s2 += __shfl_xor_sync(EXL3_FULL_MASK, s2, o);
     }
     if ((t & 31) == 0) { sh_s1[t >> 5] = s1; sh_s2[t >> 5] = s2; }
     __syncthreads();
@@ -323,8 +332,8 @@ __device__ __forceinline__ void gemv_int8_row_sums
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1)
         {
-            v1 += __shfl_xor_sync(0xffffffff, v1, o);
-            v2 += __shfl_xor_sync(0xffffffff, v2, o);
+            v1 += __shfl_xor_sync(EXL3_FULL_MASK, v1, o);
+            v2 += __shfl_xor_sync(EXL3_FULL_MASK, v2, o);
         }
         if (t == 0)
         {
@@ -385,7 +394,7 @@ __device__ __forceinline__ void gemv_int8_unit_wide
     {
         uint2 r2 = {};
         if (kb + 2 < nrows) r2 = *(const uint2*) (bp + (size_t) (kb + 2) * row_stride);
-        uint32_t prev = __shfl_sync(0xffffffff, r0.y, shfl_src);
+        uint32_t prev = __shfl_sync(EXL3_FULL_MASK, r0.y, shfl_src);
 
         uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
         uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
@@ -450,12 +459,12 @@ __device__ __forceinline__ void gemv_int8_unit_wide
     #pragma unroll
     for (int r = 0; r < M; ++r)
     {
-        iacc0[r] += __shfl_xor_sync(0xffffffff, iacc0[r], 1);
-        iacc1[r] += __shfl_xor_sync(0xffffffff, iacc1[r], 1);
+        iacc0[r] += __shfl_xor_sync(EXL3_FULL_MASK, iacc0[r], 1);
+        iacc1[r] += __shfl_xor_sync(EXL3_FULL_MASK, iacc1[r], 1);
         if constexpr (residual)
         {
-            jacc0[r] += __shfl_xor_sync(0xffffffff, jacc0[r], 1);
-            jacc1[r] += __shfl_xor_sync(0xffffffff, jacc1[r], 1);
+            jacc0[r] += __shfl_xor_sync(EXL3_FULL_MASK, jacc0[r], 1);
+            jacc1[r] += __shfl_xor_sync(EXL3_FULL_MASK, jacc1[r], 1);
         }
     }
     if (!(lane & 1))
@@ -586,16 +595,16 @@ __device__ __forceinline__ void gemv_int8_pair_tail
         #pragma unroll
         for (int o = 1; o < 4; o <<= 1)
         {
-            ia0[r] += __shfl_xor_sync(0xffffffff, ia0[r], o);
-            ia1[r] += __shfl_xor_sync(0xffffffff, ia1[r], o);
-            ib0[r] += __shfl_xor_sync(0xffffffff, ib0[r], o);
-            ib1[r] += __shfl_xor_sync(0xffffffff, ib1[r], o);
+            ia0[r] += __shfl_xor_sync(EXL3_FULL_MASK, ia0[r], o);
+            ia1[r] += __shfl_xor_sync(EXL3_FULL_MASK, ia1[r], o);
+            ib0[r] += __shfl_xor_sync(EXL3_FULL_MASK, ib0[r], o);
+            ib1[r] += __shfl_xor_sync(EXL3_FULL_MASK, ib1[r], o);
             if constexpr (residual)
             {
-                ja0[r] += __shfl_xor_sync(0xffffffff, ja0[r], o);
-                ja1[r] += __shfl_xor_sync(0xffffffff, ja1[r], o);
-                jb0[r] += __shfl_xor_sync(0xffffffff, jb0[r], o);
-                jb1[r] += __shfl_xor_sync(0xffffffff, jb1[r], o);
+                ja0[r] += __shfl_xor_sync(EXL3_FULL_MASK, ja0[r], o);
+                ja1[r] += __shfl_xor_sync(EXL3_FULL_MASK, ja1[r], o);
+                jb0[r] += __shfl_xor_sync(EXL3_FULL_MASK, jb0[r], o);
+                jb1[r] += __shfl_xor_sync(EXL3_FULL_MASK, jb1[r], o);
             }
         }
     }
@@ -869,14 +878,14 @@ __device__ __forceinline__ void gemv_int8_stage_slice
         float mx = 0.0f;
         for (int i = t; i < nel; i += NUM_THREADS) mx = fmaxf(mx, fabsf(__half2float(sh_ah[i])));
         #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(EXL3_FULL_MASK, mx, o));
         if ((t & 31) == 0) sh_red[t >> 5] = mx;
         __syncthreads();
         if (t < 32)
         {
             float v = t < (NUM_THREADS >> 5) ? sh_red[t] : 0.0f;
             #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+            for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(EXL3_FULL_MASK, v, o));
             if (t == 0) sh_red[32] = fmaxf(v, 1e-8f) / 127.0f;
         }
         __syncthreads();
@@ -904,8 +913,8 @@ __device__ __forceinline__ void gemv_int8_stage_slice
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1)
         {
-            l1 += __shfl_xor_sync(0xffffffff, l1, o);
-            l2 += __shfl_xor_sync(0xffffffff, l2, o);
+            l1 += __shfl_xor_sync(EXL3_FULL_MASK, l1, o);
+            l2 += __shfl_xor_sync(EXL3_FULL_MASK, l2, o);
         }
         if ((t & 31) == 0) { ((int*) sh_red)[t >> 5] = l1; sh_red[16 + (t >> 5)] = __int_as_float(l2); }
         __syncthreads();
@@ -916,8 +925,8 @@ __device__ __forceinline__ void gemv_int8_stage_slice
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1)
             {
-                v1 += __shfl_xor_sync(0xffffffff, v1, o);
-                v2 += __shfl_xor_sync(0xffffffff, v2, o);
+                v1 += __shfl_xor_sync(EXL3_FULL_MASK, v1, o);
+                v2 += __shfl_xor_sync(EXL3_FULL_MASK, v2, o);
             }
             if (t == 0)
             {
@@ -1142,14 +1151,14 @@ void exl3_gemv_int8_coop_kernel
         if (size_m == 1)
         {
             #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(EXL3_FULL_MASK, mx, o));
             if (lane == 0) sh_m[threadIdx.x >> 5] = mx;
             __syncthreads();
             if (threadIdx.x < 32)
             {
                 float v = threadIdx.x < (NUM_THREADS >> 5) ? sh_m[threadIdx.x] : 0.0f;
                 #pragma unroll
-                for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+                for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(EXL3_FULL_MASK, v, o));
                 if (threadIdx.x == 0) partial_max[blockIdx.x] = v;
             }
         }
@@ -1169,14 +1178,14 @@ void exl3_gemv_int8_coop_kernel
             float mx = 0.0f;
             for (int i = t; i < size_k; i += NUM_THREADS) mx = fmaxf(mx, fabsf(__half2float(Ar[i])));
             #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(EXL3_FULL_MASK, mx, o));
             if ((t & 31) == 0) sh_r[t >> 5] = mx;
             __syncthreads();
             if (t < 32)
             {
                 float v = t < (NUM_THREADS >> 5) ? sh_r[t] : 0.0f;
                 #pragma unroll
-                for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+                for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(EXL3_FULL_MASK, v, o));
                 if (t == 0) sh_r[32] = fmaxf(v, 1e-8f) / 127.0f;
             }
             __syncthreads();
@@ -1217,14 +1226,14 @@ void exl3_gemv_int8_coop_kernel
             float v = 0.0f;
             for (int i = threadIdx.x; i < gridDim.x; i += NUM_THREADS) v = fmaxf(v, partial_max[i]);
             #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+            for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(EXL3_FULL_MASK, v, o));
             if ((threadIdx.x & 31) == 0) sh_q[threadIdx.x >> 5] = v;
             __syncthreads();
             if (threadIdx.x < 32)
             {
                 float w = threadIdx.x < (NUM_THREADS >> 5) ? sh_q[threadIdx.x] : 0.0f;
                 #pragma unroll
-                for (int o = 16; o > 0; o >>= 1) w = fmaxf(w, __shfl_xor_sync(0xffffffff, w, o));
+                for (int o = 16; o > 0; o >>= 1) w = fmaxf(w, __shfl_xor_sync(EXL3_FULL_MASK, w, o));
                 if (threadIdx.x == 0) sh_q[32] = fmaxf(w, 1e-8f) / 127.0f;
             }
             __syncthreads();

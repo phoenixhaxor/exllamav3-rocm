@@ -314,7 +314,7 @@ void set_kernel_attr_once(void* kernel, size_t smem)
     auto key = std::make_tuple(device, kernel, smem);
     if (attr_set.find(key) != attr_set.end()) return;
 
-    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+    cuda_check(cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
     attr_set.insert(key);
 }
 

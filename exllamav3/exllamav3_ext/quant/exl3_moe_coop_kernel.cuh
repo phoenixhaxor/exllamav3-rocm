@@ -286,7 +286,7 @@ __device__ __forceinline__ void build_runs
     #pragma unroll
     for (int o = 1; o < 32; o <<= 1)
     {
-        int n = __shfl_up_sync(0xffffffffu, v, o);
+        int n = __shfl_up_sync(EXL3_FULL_MASK, v, o);
         if (lane >= o) v += n;
     }
     if (lane == 31) sh_scan[warp] = v;
@@ -473,21 +473,21 @@ __device__ __forceinline__ void gemv_tile
                 }
                 else if constexpr (bits == 4)
                 {
-                    uint32_t aw = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
+                    uint32_t aw = __shfl_sync(EXL3_FULL_MASK, bw[t], (lane + 31) & 31);
                     exl3_gemv_ns::dq8_regs_4bits<cb>(aw, bw[t], f0, f1);
                 }
                 else if constexpr (bits == 2)
                 {
                     const uint32_t w = bw[t >> 1];
                     const int base = (t & 1) << 4;
-                    uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
-                    uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
+                    uint32_t bwv = __shfl_sync(EXL3_FULL_MASK, w, base + x_src_b);
+                    uint32_t awv = __shfl_sync(EXL3_FULL_MASK, w, base + x_src_a);
                     exl3_gemv_ns::dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
                 }
                 else  // bits == 3
                 {
-                    uint32_t awv = __shfl_sync(0xffffffffu, bw[t], x_src_a);
-                    uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
+                    uint32_t awv = __shfl_sync(EXL3_FULL_MASK, bw[t], x_src_a);
+                    uint32_t bwv = __shfl_sync(EXL3_FULL_MASK, bw[t], x_src_b);
                     exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
                 }
 
@@ -589,7 +589,7 @@ __device__ __forceinline__ void write_empty_row_chunk(const MoeCoopParams& p, in
             }
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1)
-                dot += __shfl_xor_sync(0xffffffffu, dot, o);
+                dot += __shfl_xor_sync(EXL3_FULL_MASK, dot, o);
             gv = 1.0f / (1.0f + __expf(-dot));
         }
         const float* sh = p.sh_out + (size_t) row * p.H + col;
@@ -887,7 +887,7 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
             }
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1)
-                dot += __shfl_xor_sync(0xffffffffu, dot, o);
+                dot += __shfl_xor_sync(EXL3_FULL_MASK, dot, o);
             if (lane == 0) sh_part[warp] = dot;
             __syncthreads();
             if (threadIdx.x == 0)

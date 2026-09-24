@@ -125,9 +125,9 @@ static QtLaunch qt_launch(int device, int K, int cb, int L)
     const auto& instances = optimized ? quantize_tiles_optimized_instances : quantize_tiles_kernel_instances;
     const auto& instances_l160 = optimized ? quantize_tiles_optimized_instances_l160 : quantize_tiles_kernel_instances_l160;
     auto kernel = L == 256 ? instances[K - 1 + 8 * cb] : instances_l160[K - 1];
-    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+    cuda_check(cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
     cudaFuncAttributes attr;
-    cuda_check(cudaFuncGetAttributes(&attr, kernel));
+    cuda_check(cudaFuncGetAttributes(&attr, (const void*) kernel));
     int blocks_per_sm;
     cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, attr.maxThreadsPerBlock, shmem));
     return {optimized, kernel, attr.maxThreadsPerBlock, shmem, blocks_per_sm};
@@ -270,7 +270,7 @@ void quantize_tiles_frac
     for (const auto& tensor : {input_tiles, output_tiles, output_indices, temp_costs, temp_edges})
         TORCH_CHECK(tensor.is_contiguous() && tensor.device() == input_tiles.device(), "quantize_tiles_frac: layout");
     fp_quantize_tiles_kernel kernel = nullptr;
-    struct { int ka; uint32_t mask; fp_quantize_tiles_kernel (*fn)(); } const table[] = {
+    struct { int ka; unsigned long long mask; fp_quantize_tiles_kernel (*fn)(); } const table[] = {
         {1, 0xaaaau, &quantize_tiles_frac_kernel_a1_maaaa},
         {2, 0xaaaau, &quantize_tiles_frac_kernel_a2_maaaa},
         {3, 0xaaaau, &quantize_tiles_frac_kernel_a3_maaaa},
@@ -280,7 +280,7 @@ void quantize_tiles_frac
     const int num_tiles = input_tiles.size(0);
     if (!num_tiles) return;
     const int shmem = L * sizeof(half) + 32 * sizeof(int) + 128;
-    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+    cuda_check(cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
     const int max_batch_size = (int) MIN(temp_costs.size(0), temp_edges.size(0));
     for (int batch_i = 0; batch_i < num_tiles; batch_i += max_batch_size)
     {

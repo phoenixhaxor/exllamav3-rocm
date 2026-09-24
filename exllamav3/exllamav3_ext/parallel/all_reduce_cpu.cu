@@ -19,6 +19,7 @@ namespace cg = cooperative_groups;
 
 #ifndef __linux__
 #include <intrin.h>
+
 #endif
 
 // Schedule CPU reduce job. Called by master device proces in all_reduce_cpu and assumes all

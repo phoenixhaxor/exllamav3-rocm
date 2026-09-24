@@ -14,7 +14,7 @@ __device__ inline uint64_cu warp_reduce_sum(uint64_cu v)
 {
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
-        uint64_cu other_v = __shfl_down_sync(0xffffffff, v, offset);
+        uint64_cu other_v = __shfl_down_sync(EXL3_FULL_MASK, v, offset);
         v += other_v;
     }
     return v;

@@ -112,7 +112,7 @@ static void moe_coop_smem_optin(void* kernel, int smem)
     static std::map<void*, int> done;
     auto it = done.find(kernel);
     if (it != done.end() && it->second >= smem) return;
-    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    cuda_check(cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     done[kernel] = smem;
 }
 
@@ -202,7 +202,7 @@ MoeCoopParams exl3_moe_coop_prepare
     if (!p.gu_f32) TORCH_CHECK_DTYPE(gu_u, kHalf);
     TORCH_CHECK(gu_g.scalar_type() == gu_u.scalar_type(), "exl3_moe_coop: gate/up scratch dtype mismatch");
     // Scratch capacity in slots: the smallest of the per-slot buffers
-    const int slots_max = (int) std::min({ had_g.numel() / p.Hi, had_u.numel() / p.Hi, gu_g.numel() / p.I,
+    const int slots_max = (int) (std::min)({ had_g.numel() / p.Hi, had_u.numel() / p.Hi, gu_g.numel() / p.I,
                                            gu_u.numel() / p.I, act_out.numel() / p.I, d_out.numel() / p.Ho });
     auto check_scratch = [&] (const at::Tensor& t, int width)
     {

@@ -1,5 +1,13 @@
 #include <cuda_fp16.h>
+#ifdef __HIP_PLATFORM_AMD__
+#include <hip/hip_fp16.h>
+#else
+#ifdef __HIP_PLATFORM_AMD__
+#include <hip/hip_fp16.h>
+#else
 #include <cuda_fp16.hpp>
+#endif
+#endif
 #include "activation.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>

@@ -85,9 +85,9 @@ static int target_blocks(int device)
     if (g_target_blocks < 0)
     {
         const char* e = std::getenv("EXL3_RDNA3_TARGET_BLOCKS");
-        // Default: one full residency wave (LDS allows 6 blocks per WGP = 3 per CU); a partial
-        // second wave of blocks roughly doubles the tail
-        g_target_blocks = e ? atoi(e) : 3 * DevCtx::instance().get_num_sms(device);
+        // Default: one full residency wave. The multiprocessor count is WGPs on gfx11 (48 on a
+        // 7900 XTX) and LDS allows 6 blocks per WGP; a partial second wave roughly doubles the tail
+        g_target_blocks = e ? atoi(e) : 6 * DevCtx::instance().get_num_sms(device);
     }
     return g_target_blocks;
 }
@@ -105,6 +105,7 @@ static void choose_splits(int items, int kblocks, size_t ws_per_split, int devic
     splits = (kblocks + kb_per_split - 1) / kb_per_split;
     ks_per_split = kb_per_split * 8;
 }
+
 #endif
 
 bool exl3_rdna3_gemm
@@ -124,7 +125,8 @@ bool exl3_rdna3_gemm
     int device,
     cudaStream_t stream,
     Graph* graph,
-    const half* A_up
+    const half* A_up,
+    const Exl3Rdna3GNorm* gn
 )
 {
     #ifdef __HIP_PLATFORM_AMD__
@@ -146,6 +148,7 @@ bool exl3_rdna3_gemm
         // Rows per launch pair, bounded by the transformed-input workspace
         const int max_rows = (int) MIN((size_t) EXL3_RDNA3_XH_BYTES / ((size_t) size_k * 2), (size_t) EXL3_RDNA3_XCS_FLOATS / kblocks);
         TORCH_CHECK(max_rows >= 1, "exl3_rdna3_gemm: k too large for the input workspace");
+        if (gn && size_m > max_rows) return false;   // the gate pointer is not re-based per row chunk
 
         const uint32_t* B32 = (const uint32_t*) B;
         int* counters = g_counters[device];
@@ -165,7 +168,8 @@ bool exl3_rdna3_gemm
             choose_splits(groups * row_chunks, kblocks, (size_t) m * size_n * sizeof(float), device, splits, ks_per_split);
 
             const int had_tasks = m * kblocks;
-            exl3_rdna3_had_kernel<<<(had_tasks + 7) / 8, 256, 0, stream>>>(A_r, suh, xh, xcs, m, size_k, nullptr, A_up ? A_up + (size_t) r0 * size_k : nullptr);
+            exl3_rdna3_had_kernel<<<(had_tasks + 7) / 8, 256, 0, stream>>>(A_r, suh, xh, xcs, m, size_k, nullptr, A_up ? A_up + (size_t) r0 * size_k : nullptr,
+                                                                           gn ? *gn : Exl3Rdna3GNorm {});
             kernel<<<dim3(groups * splits, row_chunks), EXL3_RDNA3_THREADS, 0, stream>>>
             (
                 xh, B32, C_r, m, size_k, size_n, counters, xcs, ws, svh, splits, ks_per_split, Exl3Rdna3MTab {}
@@ -241,7 +245,7 @@ bool exl3_rdna3_mgemm
         uint2* xh = g_xh[device];
         float* xcs = g_xcs[device];
         const int had_tasks = size_m * kblocks;
-        exl3_rdna3_had_kernel<<<dim3((had_tasks + 7) / 8, num_src), 256, 0, stream>>>(A, nullptr, xh, xcs, size_m, size_k, suh_tab, nullptr);
+        exl3_rdna3_had_kernel<<<dim3((had_tasks + 7) / 8, num_src), 256, 0, stream>>>(A, nullptr, xh, xcs, size_m, size_k, suh_tab, nullptr, Exl3Rdna3GNorm {});
 
         Exl3Rdna3MTab mt { b_tab, svh_tab, c_tab, n_stride_tab, src_tab };
         kernel<<<dim3(groups * splits, row_chunks, num_entries), EXL3_RDNA3_THREADS, 0, stream>>>

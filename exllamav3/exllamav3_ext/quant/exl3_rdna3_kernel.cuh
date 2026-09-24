@@ -89,10 +89,16 @@ struct Funnel
 // instead (see the kernel epilogue), saving the per-weight fma
 __device__ __forceinline__ uint32_t mul1_raw_pair(uint32_t x0, uint32_t x1)
 {
-    // v_sad_u8 against zero is a full-rate byte sum (v_dot4_u32_u8 is half rate on RDNA3)
+    // v_sad_u8 against zero is a full-rate byte sum (v_dot4_u32_u8 is half rate on RDNA3); v_sad_hi_u8
+    // adds the second sum into the high half, so the pair packs without a separate shift/or
+#ifdef KB_NOSADHI
     uint32_t s0 = __builtin_amdgcn_sad_u8(mul1_mul(x0), 0u, 0x6400u);
     uint32_t s1 = __builtin_amdgcn_sad_u8(mul1_mul(x1), 0u, 0x6400u);
     return s0 | (s1 << 16);
+#else
+    const uint32_t s = __builtin_amdgcn_sad_u8(mul1_mul(x0), 0u, 0x64006400u);
+    return __builtin_amdgcn_sad_hi_u8(mul1_mul(x1), 0u, s);
+#endif
 }
 
 // Eight 16-bit windows (positions t_offset .. +7 of the tile, t_offset = 8 * lane) for integer bitrates,
@@ -179,7 +185,8 @@ void exl3_rdna3_had_kernel
     int size_m,
     int size_k,
     const uint64_t* __restrict__ suh_tab,  // multi-source: suh per blockIdx.y, one xh / xcs slab each
-    const half* __restrict__ A_up          // gated MLP: input is silu(A) * A_up (act_mul_kernel_h rounding)
+    const half* __restrict__ A_up,         // gated MLP: input is silu(A) * A_up (act_mul_kernel_h rounding)
+    Exl3Rdna3GNorm gn                      // gated RMSNorm prologue, one head per 128-block (A is bf16)
 )
 {
     using namespace exl3_rdna3_ns;
@@ -199,17 +206,79 @@ void exl3_rdna3_had_kernel
 
     const half2* ap = (const half2*) (A + (size_t) m * size_k + kbase + lane * 4);
     const half2* sp = (const half2*) (suh + kbase + lane * 4);
-    half2 x01 = ap[0], x23 = ap[1];
+    half2 x01, x23;
+    if (gn.flags & GN_ACTIVE)
+    {
+        // gated_rms_norm (small path, one warp per head): fma sum of squares, xor-reduce 16 .. 1,
+        // x * w * rmf, then * act(g), rounded to fp16
+        auto bf = [] (uint32_t v, int hi) { return __uint_as_float(hi ? (v & 0xffff0000u) : (v << 16)); };
+        const size_t off = (size_t) m * size_k + kbase + lane * 4;
+        const uint2 xr = *(const uint2*) (((const uint16_t*) A) + off);
+        float f[4] = { bf(xr.x, 0), bf(xr.x, 1), bf(xr.y, 0), bf(xr.y, 1) };
+        float ss = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) ss = fmaf(f[i], f[i], ss);
+        #pragma unroll
+        for (int i = 16; i > 0; i >>= 1) ss += __shfl_xor(ss, i);
+        const float rmf = rsqrtf(ss / 128.0f + gn.eps);
+        float w[4], g[4];
+        if (gn.flags & GN_W_BF16)
+        {
+            const uint2 wr = *(const uint2*) (((const uint16_t*) gn.w) + lane * 4);
+            w[0] = bf(wr.x, 0); w[1] = bf(wr.x, 1); w[2] = bf(wr.y, 0); w[3] = bf(wr.y, 1);
+        }
+        else
+        {
+            const float4 wr = *(const float4*) (((const float*) gn.w) + lane * 4);
+            w[0] = wr.x; w[1] = wr.y; w[2] = wr.z; w[3] = wr.w;
+        }
+        if (gn.flags & GN_G_BF16)
+        {
+            const uint2 gr = *(const uint2*) (((const uint16_t*) gn.g) + off);
+            g[0] = bf(gr.x, 0); g[1] = bf(gr.x, 1); g[2] = bf(gr.y, 0); g[3] = bf(gr.y, 1);
+        }
+        else
+        {
+            const float4 gr = *(const float4*) (((const float*) gn.g) + off);
+            g[0] = gr.x; g[1] = gr.y; g[2] = gr.z; g[3] = gr.w;
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            const float wi = gn.bias != 0.0f ? w[i] + gn.bias : w[i];
+            float v = f[i] * wi * rmf;
+            const float r = __fdividef(1.0f, 1.0f + __expf(-g[i]));
+            v *= (gn.flags & GN_SIGMOID) ? r : g[i] * r;
+            f[i] = v;
+        }
+        x01 = __floats2half2_rn(f[0], f[1]);
+        x23 = __floats2half2_rn(f[2], f[3]);
+    }
+    else
+    {
+        x01 = ap[0];
+        x23 = ap[1];
+    }
     if (A_up)
     {
         const half2* up = (const half2*) (A_up + (size_t) m * size_k + kbase + lane * 4);
-        auto silu2 = [] (half2 x) -> half2
+        auto sigmoid2 = [] (half2 x) -> half2
         {
             const half2 one = __float2half2_rn(1.0f);
-            return __hmul2(x, h2rcp(__hadd2(one, h2exp(__hneg2(x)))));
+            return h2rcp(__hadd2(one, h2exp(__hneg2(x))));
         };
-        x01 = __hmul2(silu2(x01), up[0]);
-        x23 = __hmul2(silu2(x23), up[1]);
+        if (gn.flags & GN_UP_SIGMOID)
+        {
+            // mul_sigmoid_kernel_h: x * sigmoid(g)
+            x01 = __hmul2(x01, sigmoid2(up[0]));
+            x23 = __hmul2(x23, sigmoid2(up[1]));
+        }
+        else
+        {
+            // act_mul_kernel_h<ACT_SILU>: silu(x) * u
+            x01 = __hmul2(__hmul2(x01, sigmoid2(x01)), up[0]);
+            x23 = __hmul2(__hmul2(x23, sigmoid2(x23)), up[1]);
+        }
     }
     half2 a01 = __hmul2(x01, sp[0]);
     half2 a23 = __hmul2(x23, sp[1]);
@@ -248,32 +317,35 @@ __device__ unsigned long long kb_trace[3 * 8192];
 #define KB_T(slot) do {} while (0)
 #endif
 
+// One work unit: output columns group * 128 .. +127 of entry e, rows rc * MR .. +MR-1, k-slices of split
 template <int bits, bool half_k, int cb, int MR, bool c_fp32>
-__global__ __launch_bounds__(EXL3_RDNA3_THREADS) EXL3_RDNA3_WPE
-void exl3_rdna3_kernel
+__device__ __forceinline__ void exl3_rdna3_unit
 (
-    const uint2* __restrict__ xh,       // input after suh / Hadamard, pair layout (exl3_rdna3_had_kernel)
+    const int e,
+    const int rc,
+    const int group,
+    const int split,
+    const int row_chunks,
+    const uint2* __restrict__ xh,
     const uint32_t* __restrict__ B,
     void* __restrict__ C,
     int size_m,
     int size_k,
     int size_n,
     int* __restrict__ counters,
-    const float* __restrict__ xcs,      // per-128-block sums of xh
+    const float* __restrict__ xcs,
     float* __restrict__ ws,
     const half* __restrict__ svh,
     int splits,
     int ks_per_split,
-    Exl3Rdna3MTab mt
+    const Exl3Rdna3MTab& mt
 )
 {
     using namespace exl3_rdna3_ns;
-    KB_T(0);
 
     int n_stride = size_n;
     if (mt.b)
     {
-        const int e = blockIdx.z;
         const int src = mt.src ? mt.src[e] : e;
         B = (const uint32_t*) mt.b[e];
         svh = (const half*) mt.svh[e];
@@ -283,7 +355,7 @@ void exl3_rdna3_kernel
         xh += (size_t) src * size_m * (size_k / 16) * 4;
         xcs += (size_t) src * size_m * (size_k / 128);
         ws += (size_t) e * splits * size_m * size_n;
-        counters += (size_t) e * gridDim.y * (size_n / 128);
+        counters += (size_t) e * row_chunks * (size_n / 128);
     }
 
     constexpr int TWORDS = half_k ? 4 * (2 * bits + 1) : 8 * bits;   // uint32 per 16x16 tile
@@ -311,9 +383,7 @@ void exl3_rdna3_kernel
 
     const int ntiles = size_n / 16;
     const int groups = ntiles / NT;
-    const int group = blockIdx.x % groups;
-    const int split = blockIdx.x / groups;
-    const int row0 = blockIdx.y * MR;
+    const int row0 = rc * MR;
     const int rows = min(MR, size_m - row0);
     const int kslices = size_k / 16;
     const int ks_begin = split * ks_per_split;
@@ -339,11 +409,18 @@ void exl3_rdna3_kernel
     // Raw buffer over the trellis (byte offsets; EXL3 tensors are well below 2 GB)
     const __amdgpu_buffer_rsrc_t brsrc = __builtin_amdgcn_make_buffer_rsrc((void*) B, (short) 0, 0x7fffffff, 0x31004000);
 
-    float acc[MR][TPW][2];
+#ifdef KB_NACC
+    constexpr int NACC = KB_NACC;   // 4: x / y halves in separate accumulators (no gain measured)
+#else
+    constexpr int NACC = 2;
+#endif
+    float acc[MR][TPW][NACC];
     #pragma unroll
     for (int m = 0; m < MR; ++m)
         #pragma unroll
-        for (int j = 0; j < TPW; ++j) acc[m][j][0] = acc[m][j][1] = 0.0f;
+        for (int j = 0; j < TPW; ++j)
+            #pragma unroll
+            for (int a = 0; a < NACC; ++a) acc[m][j][a] = 0.0f;
 
     for (int kc0 = ks_begin; kc0 < ks_end; kc0 += KCS)
     {
@@ -480,16 +557,26 @@ void exl3_rdna3_kernel
                     for (int j = 0; j < TPW; ++j)
                     {
                         acc[m][j][0] = dot2(wd[j][0], xv.x, acc[m][j][0]);
-                        acc[m][j][0] = dot2(wd[j][1], xv.y, acc[m][j][0]);
+                        acc[m][j][NACC - 2] = dot2(wd[j][1], xv.y, acc[m][j][NACC - 2]);
                         acc[m][j][1] = dot2(wd[j][2], xv.x, acc[m][j][1]);
-                        acc[m][j][1] = dot2(wd[j][3], xv.y, acc[m][j][1]);
+                        acc[m][j][NACC - 1] = dot2(wd[j][3], xv.y, acc[m][j][NACC - 1]);
                     }
                 }
             }
         }
     }
 
-    KB_T(1);
+    if constexpr (NACC == 4)
+    {
+        #pragma unroll
+        for (int m = 0; m < MR; ++m)
+            #pragma unroll
+            for (int j = 0; j < TPW; ++j)
+            {
+                acc[m][j][0] += acc[m][j][2];
+                acc[m][j][1] += acc[m][j][3];
+            }
+    }
 
     // Reduce over the four lanes sharing a column; lane l holds columns l / 4 and 8 + l / 4 of its tile
     #pragma unroll
@@ -524,7 +611,7 @@ void exl3_rdna3_kernel
     // Cross-split reduction: last block to arrive for this (row chunk, column group) sums the partials
     if (splits > 1)
     {
-        const int gidx = blockIdx.y * groups + group;
+        const int gidx = rc * groups + group;
         float* wp = ws + ((size_t) split * size_m + row0) * size_n + group * 128;
         for (int idx = threadIdx.x; idx < rows * 128; idx += THREADS)
         {
@@ -539,7 +626,7 @@ void exl3_rdna3_kernel
             last_flag = prev == splits - 1;
         }
         __syncthreads();
-        if (!last_flag) { KB_T(2); return; }
+        if (!last_flag) return;
         __threadfence();
 
         for (int idx = threadIdx.x; idx < rows * 128; idx += THREADS)
@@ -583,6 +670,35 @@ void exl3_rdna3_kernel
             cp[1] = __floats2half2_rn(h2, h3);
         }
     }
+}
+
+template <int bits, bool half_k, int cb, int MR, bool c_fp32>
+__global__ __launch_bounds__(EXL3_RDNA3_THREADS) EXL3_RDNA3_WPE
+void exl3_rdna3_kernel
+(
+    const uint2* __restrict__ xh,       // input after suh / Hadamard, pair layout (exl3_rdna3_had_kernel)
+    const uint32_t* __restrict__ B,
+    void* __restrict__ C,
+    int size_m,
+    int size_k,
+    int size_n,
+    int* __restrict__ counters,
+    const float* __restrict__ xcs,      // per-128-block sums of xh
+    float* __restrict__ ws,
+    const half* __restrict__ svh,
+    int splits,
+    int ks_per_split,
+    Exl3Rdna3MTab mt
+)
+{
+    KB_T(0);
+    const int groups = size_n / 128;
+    exl3_rdna3_unit<bits, half_k, cb, MR, c_fp32>
+    (
+        blockIdx.z, blockIdx.y, blockIdx.x % groups, blockIdx.x / groups, gridDim.y,
+        xh, B, C, size_m, size_k, size_n, counters, xcs, ws, svh, splits, ks_per_split, mt
+    );
+    KB_T(1);
     KB_T(2);
 }
 

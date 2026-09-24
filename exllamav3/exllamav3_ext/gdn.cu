@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <cuda_fp16.h>
 #ifdef __HIP_PLATFORM_AMD__
 #include <hip/hip_fp16.h>
@@ -874,6 +875,154 @@ void cuda_recurrent_gated_delta_rule_kernel_128
     }
 }
 
+// 128x128 heads, per-head decay, v split 4: the state slice (32 k-rows x 1 v-column per thread) stays
+// in registers across the token loop, so the state is read once and written once per call (plus the
+// per-token history slots) instead of read twice per token. Same reduction orders and update
+// expressions as cuda_recurrent_gated_delta_rule_kernel_128<save_history, 4>
+static bool gdn_reg_enabled()
+{
+    static const bool e = !(std::getenv("EXL3_GDN_REG") && std::getenv("EXL3_GDN_REG")[0] == '0');
+    return e;
+}
+
+template <bool save_history>
+__global__ __launch_bounds__(128)
+void cuda_recurrent_gated_delta_rule_kernel_128_reg
+(
+    const bfloat16* __restrict__ mixed_qkv,
+    const float* __restrict__ g,
+    const bfloat16* __restrict__ beta,
+    float* __restrict__ recurrent_state,
+    bfloat16* __restrict__ core_attn_out,
+    const int bsz,
+    const int seqlen,
+    const int num_k_heads,
+    const int num_v_heads,
+    const int k_head_dim,
+    const int v_head_dim,
+    const float scale,
+    const int* __restrict__ slots,
+    const int history_stride,
+    const float* __restrict__ D
+)
+{
+    constexpr int HEAD_DIM = 128;
+    constexpr int NSUB = 4;                      // k-slices (one per warp)
+    constexpr int BTS = HEAD_DIM / NSUB;         // 32 k-rows per thread
+    constexpr size_t HEAD_STATE_SIZE = HEAD_DIM * HEAD_DIM;
+
+    const int group = num_v_heads / num_k_heads;
+    const size_t state_size = group * num_k_heads * HEAD_STATE_SIZE;
+    const size_t slot_size = (size_t) history_stride * state_size;
+
+    const int bi = blockIdx.x;
+    mixed_qkv += bi * seqlen * (3 * HEAD_DIM * num_k_heads + HEAD_DIM * (num_v_heads - num_k_heads));
+    g +=         (size_t) bi * seqlen * (group * num_k_heads);
+    beta +=      bi * seqlen * (group * num_k_heads);
+    const int state_slot = slots ? slots[bi] : bi;
+    float* slot_state = recurrent_state + (size_t) state_slot * slot_size;
+    core_attn_out += bi * seqlen * num_v_heads * HEAD_DIM;
+
+    const int tid = threadIdx.x;                 // element index for the q / k norms
+    const int t = tid & 31;                      // v column within the chunk
+    const int bt = tid >> 5;                     // k-slice (warp)
+    const int lane = t;
+    const int warp = bt;
+    const int head = blockIdx.y;
+    const int k_head = head / group;
+    const int v_start = blockIdx.z * 32;
+
+    __shared__ float sh_red[2][HEAD_DIM / 32];
+    __shared__ float sh_k[HEAD_DIM];
+    __shared__ float sh_q[HEAD_DIM];
+    __shared__ float sh_dot1[NSUB][32];
+    __shared__ float sh_dot2[NSUB][32];
+
+    // Load this thread's state slice: rows bt * 32 + i, column v_start + t
+    const size_t col_off = (size_t) head * HEAD_STATE_SIZE + v_start + t + (size_t) bt * BTS * HEAD_DIM;
+    float st[BTS];
+    #pragma unroll
+    for (int i = 0; i < BTS; ++i) st[i] = slot_state[col_off + (size_t) i * HEAD_DIM];
+
+    for (int s = 0; s < seqlen; ++s)
+    {
+        const bfloat16* gl_q = mixed_qkv + k_head * HEAD_DIM;
+        const bfloat16* gl_k = mixed_qkv + (num_k_heads + k_head) * HEAD_DIM;
+        const bfloat16* gl_v = mixed_qkv + (2 * num_k_heads * HEAD_DIM) + head * HEAD_DIM + v_start;
+        bfloat16* out = core_attn_out + head * HEAD_DIM + v_start;
+
+        float q = __bfloat162float(gl_q[tid]);
+        float k = __bfloat162float(gl_k[tid]);
+        float sumq = q * q;
+        float sumk = k * k;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+        {
+            sumq += __shfl_xor_sync(EXL3_FULL_MASK, sumq, offset);
+            sumk += __shfl_xor_sync(EXL3_FULL_MASK, sumk, offset);
+        }
+        if (lane == 0)
+        {
+            sh_red[0][warp] = sumq;
+            sh_red[1][warp] = sumk;
+        }
+        __syncthreads();
+        sumq = lane < HEAD_DIM / 32 ? sh_red[0][lane] : 0.0f;
+        sumk = lane < HEAD_DIM / 32 ? sh_red[1][lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+        {
+            sumq += __shfl_xor_sync(EXL3_FULL_MASK, sumq, offset);
+            sumk += __shfl_xor_sync(EXL3_FULL_MASK, sumk, offset);
+        }
+        sh_k[tid] = k * rsqrtf(sumk + 1e-6f);
+        sh_q[tid] = q * rsqrtf(sumq + 1e-6f);
+        __syncthreads();
+
+        const float* sk = sh_k + bt * BTS;
+        const float* sq = sh_q + bt * BTS;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i) sum = sum + sk[i] * st[i];
+        sh_dot1[bt][t] = sum;
+        __syncthreads();
+
+        const float g_h = __expf(g[head]);
+        const float beta_h = __bfloat162float(beta[head]);
+        float dot1 = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < NSUB; ++j) dot1 += sh_dot1[j][t];
+        const float v = __bfloat162float(gl_v[t]) - dot1 * g_h;
+        float v_out = 0.0f;
+        const bool last = s == seqlen - 1;
+        float* hw = slot_state + (save_history && !last ? (size_t) (s + 1) * state_size : 0) + col_off;
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i)
+        {
+            float state = st[i];
+            state = state * g_h + sk[i] * v * beta_h;
+            st[i] = state;
+            if (save_history || last) hw[(size_t) i * HEAD_DIM] = state;
+            v_out = v_out + sq[i] * state;
+        }
+        sh_dot2[bt][t] = v_out;
+        __syncthreads();
+
+        if (bt == 0)
+        {
+            float vo = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < NSUB; ++j) vo += sh_dot2[j][t];
+            out[t] = __float2bfloat16_rz(vo * scale);
+        }
+
+        mixed_qkv +=     2 * HEAD_DIM * num_k_heads + HEAD_DIM * num_v_heads;
+        g +=             num_v_heads;
+        beta +=          num_v_heads;
+        core_attn_out += num_v_heads * HEAD_DIM;
+    }
+}
+
 void cuda_recurrent_gated_delta_rule_gr
 (
     const at::Tensor& mixed_qkv,
@@ -1001,6 +1150,13 @@ void cuda_recurrent_gated_delta_rule_gr
             if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 4, true>)
             else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 1, true>)
         }
+    }
+    else if (k_head_dim == 128 && v_head_dim == 128 && v_split == 4 && gdn_reg_enabled())
+    {
+        // Register-resident state (one block of 128 threads per head and 32-column chunk)
+        threads = dim3(128, 1);
+        if (!history) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128_reg<false>)
+        else          LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128_reg<true>)
     }
     else if (!history)
     {

@@ -412,9 +412,12 @@ bool exl3_gemm_silu_gr
     const at::Tensor& svh,
     bool mcg,
     bool mul1,
-    Graph* graph
+    Graph* graph,
+    bool gate_mode
 )
 {
+    // gate_mode: input is g * sigmoid(u) (attention output gate, mul_sigmoid_ rounding) instead
+    const Exl3Rdna3GNorm gn { nullptr, nullptr, 0.0f, 0.0f, GN_UP_SIGMOID };
     #ifdef __HIP_PLATFORM_AMD__
         if (g.dtype() != at::kHalf || u.dtype() != at::kHalf) return false;
         if (!g.is_contiguous() || !u.is_contiguous() || g.numel() != u.numel()) return false;
@@ -440,7 +443,62 @@ bool exl3_gemm_silu_gr
         (
             (const half*) g.data_ptr(), (const uint16_t*) B.data_ptr(), C.data_ptr(), size_m, size_k, size_n,
             K, half_k, cb, c_fp32, (const half*) suh.data_ptr(), (const half*) svh.data_ptr(), device, stream,
-            graph, (const half*) u.data_ptr()
+            graph, (const half*) u.data_ptr(), gate_mode ? &gn : nullptr
+        );
+    #else
+        return false;
+    #endif
+}
+
+// GatedDeltaNet output projection with the gated RMSNorm folded into the input transform:
+// C = gated_rms_norm(x, w, g) @ W. x is bf16 (..., heads, 128), g the gate (bf16 or fp32, same shape),
+// w the norm weight (128, bf16 or fp32). Returns false (nothing launched) where it doesn't apply
+bool exl3_gemm_gnorm_gr
+(
+    const at::Tensor& x,
+    const at::Tensor& g,
+    const at::Tensor& w,
+    float eps,
+    float bias,
+    bool sigmoid,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const at::Tensor& suh,
+    const at::Tensor& svh,
+    bool mcg,
+    bool mul1,
+    Graph* graph
+)
+{
+    #ifdef __HIP_PLATFORM_AMD__
+        if (x.dtype() != at::kBFloat16 || x.size(-1) != 128 || w.numel() != 128) return false;
+        if (g.dtype() != at::kBFloat16 && g.dtype() != at::kFloat) return false;
+        if (w.dtype() != at::kBFloat16 && w.dtype() != at::kFloat) return false;
+        if (!x.is_contiguous() || !g.is_contiguous() || !w.is_contiguous() || g.numel() != x.numel()) return false;
+        bool c_fp32 = C.dtype() == at::kFloat;
+        if (!c_fp32 && C.dtype() != at::kHalf) return false;
+        const int size_k = B.size(0) * 16;
+        if (x.numel() % size_k) return false;
+        const int size_m = (int) (x.numel() / size_k);
+        const int size_n = B.size(1) * 16;
+        if (C.numel() != (int64_t) size_m * size_n) return false;
+
+        const at::cuda::OptionalCUDAGuard device_guard(x.device());
+        cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+        const int tile_u16 = B.size(2);
+        const bool half_k = (tile_u16 % 16) != 0;
+        const int K = tile_u16 / 16;
+        const int cb = mul1 ? 2 : (mcg ? 1 : 0);
+        Exl3Rdna3GNorm gn { w.data_ptr(), g.data_ptr(), eps, bias,
+            GN_ACTIVE | (w.dtype() == at::kBFloat16 ? GN_W_BF16 : 0) | (g.dtype() == at::kBFloat16 ? GN_G_BF16 : 0) |
+            (sigmoid ? GN_SIGMOID : 0) };
+        int device;
+        cudaGetDevice(&device);
+        return exl3_rdna3_gemm
+        (
+            (const half*) x.data_ptr(), (const uint16_t*) B.data_ptr(), C.data_ptr(), size_m, size_k, size_n,
+            K, half_k, cb, c_fp32, (const half*) suh.data_ptr(), (const half*) svh.data_ptr(), device, stream,
+            graph, nullptr, &gn
         );
     #else
         return false;

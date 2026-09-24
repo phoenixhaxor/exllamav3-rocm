@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <Python.h>
 #include "gated_delta_net.h"
 #include <c10/cuda/CUDAGuard.h>
@@ -316,9 +317,16 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         graph
     );
 
-    norm->run_gr(s.core_attn_out, s.core_attn_out_f, s.z, graph);
-
-    exl3_gemm_gr(s.core_attn_out_f, o_proj->trellis, y, o_proj->suh, s.o_xh, o_proj->svh, -1, o_proj->mcg, o_proj->mul1, 0, graph);
+    // RDNA3: gated RMSNorm folded into o_proj's input transform (EXL3_FUSE_GNORM=0 disables)
+    static const bool fuse_gnorm = !(std::getenv("EXL3_FUSE_GNORM") && std::getenv("EXL3_FUSE_GNORM")[0] == '0');
+    bool fused_norm = fuse_gnorm && norm->w_groups == 1 && !norm->gate_first &&
+        exl3_gemm_gnorm_gr(s.core_attn_out, s.z, norm->weight, norm->rms_norm_eps, norm->constant_bias, norm->gate_act == 1,
+                           o_proj->trellis, y, o_proj->suh, o_proj->svh, o_proj->mcg, o_proj->mul1, graph);
+    if (!fused_norm)
+    {
+        norm->run_gr(s.core_attn_out, s.core_attn_out_f, s.z, graph);
+        exl3_gemm_gr(s.core_attn_out_f, o_proj->trellis, y, o_proj->suh, s.o_xh, o_proj->svh, -1, o_proj->mcg, o_proj->mul1, 0, graph);
+    }
     if (o_proj->bias)
         add_gr(y, o_proj->bias.value(), y, graph);
 }

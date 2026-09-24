@@ -4,7 +4,7 @@ import argparse, json, time, torch, os, tempfile
 from torch.profiler import profile, ProfilerActivity
 from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job
 from exllamav3.generator.sampler import ComboSampler
-ap = argparse.ArgumentParser(); ap.add_argument("-m", required = True); ap.add_argument("-dm"); ap.add_argument("--mtp", action = "store_true"); ap.add_argument("--steps", type = int, default = 30)
+ap = argparse.ArgumentParser(); ap.add_argument("-m", required = True); ap.add_argument("-dm"); ap.add_argument("--mtp", action = "store_true"); ap.add_argument("--steps", type = int, default = 30); ap.add_argument("--stack", action = "store_true")
 args = ap.parse_args()
 config = Config.from_directory(args.m); model = Model.from_config(config)
 dm = Model.from_config(config, component = "mtp") if args.mtp else (Model.from_config(Config.from_directory(args.dm)) if args.dm else None)
@@ -18,7 +18,7 @@ ids = tok.encode("<|im_start|>user\nWrite a long story about a lighthouse keeper
 gen.enqueue(Job(input_ids = ids, max_new_tokens = 3000, sampler = ComboSampler(temperature = 0.0), stop_conditions = []))
 for _ in range(20): gen.iterate()
 torch.cuda.synchronize()
-with profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+with profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack = args.stack) as prof:
     t0 = time.perf_counter()
     for _ in range(args.steps): gen.iterate()
     torch.cuda.synchronize(); wall = time.perf_counter() - t0
@@ -60,3 +60,18 @@ tt = collections.defaultdict(float)
 for s, e, n in kn: tt[n.split("(")[0][:60]] += e - s
 print("GPU time per iter by kernel:")
 for n, d in sorted(tt.items(), key = lambda x: -x[1])[:16]: print(f"  {d / 1000 / args.steps:6.2f} ms  {n}")
+
+if args.stack:
+    # CPU activity inside large GPU gaps: time per Python function / op overlapping the gaps
+    big = [(kn[i][1], kn[i + 1][0]) for i in range(len(kn) - 1) if kn[i + 1][0] - kn[i][1] > 100]
+    cpu = [e for e in ev if e.get("ph") == "X" and e.get("cat") in ("python_function", "cpu_op", "cuda_runtime") and "dur" in e]
+    acc = collections.defaultdict(float)
+    for gs, ge in big:
+        for e in cpu:
+            s0, e0 = e["ts"], e["ts"] + e["dur"]
+            ov = min(e0, ge) - max(s0, gs)
+            if ov > 0: acc[(e["cat"][:6], e["name"][:90])] += ov
+    tot = sum(ge - gs for gs, ge in big)
+    print(f"large gaps (>100 us): {len(big) / args.steps:.1f}/iter, {tot / 1000 / args.steps:.2f} ms/iter; CPU time inside them by event (inclusive):")
+    for (c, n), d in sorted(acc.items(), key = lambda x: -x[1])[:45]:
+        print(f"  {d / 1000 / args.steps:6.3f} ms  [{c}] {n}")

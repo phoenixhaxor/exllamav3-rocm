@@ -42,6 +42,20 @@ struct Exl3Rdna3MTab
     const int* src;            // input source (xh / xcs slab), or null: e
 };
 
+// Gated RMSNorm folded into the input transform (GatedDeltaNet output -> o_proj): each 128-element
+// input block is one head, y = norm(x) * (w + bias) * act(g), matching gated_rms_norm's arithmetic.
+// Input x is bf16; flags: GN_ACTIVE, GN_W_BF16 (else fp32 weight), GN_G_BF16 (else fp32 gate), GN_SIGMOID
+// GN_UP_SIGMOID: with A_up, the input is A * sigmoid(A_up) (attention output gate) instead of silu(A) * A_up
+enum { GN_ACTIVE = 1, GN_W_BF16 = 2, GN_G_BF16 = 4, GN_SIGMOID = 8, GN_UP_SIGMOID = 16 };
+struct Exl3Rdna3GNorm
+{
+    const void* w;
+    const void* g;
+    float eps;
+    float bias;
+    int flags;
+};
+
 typedef void (*fp_exl3_rdna3_kernel)
 (
     const uint2* __restrict__ xh,
@@ -79,7 +93,8 @@ __global__ void exl3_rdna3_had_kernel
     int size_m,
     int size_k,
     const uint64_t* __restrict__ suh_tab,
-    const half* __restrict__ A_up
+    const half* __restrict__ A_up,
+    Exl3Rdna3GNorm gn
 );
 
 // Returns true if the matmul was launched
@@ -100,7 +115,8 @@ bool exl3_rdna3_gemm
     int device,
     cudaStream_t stream,
     Graph* graph,
-    const half* A_up = nullptr   // gated MLP down projection: input is silu(A) * A_up
+    const half* A_up = nullptr,  // gated MLP down projection: input is silu(A) * A_up
+    const Exl3Rdna3GNorm* gn = nullptr   // gated RMSNorm prologue (A is then bf16)
 );
 
 // Several matrices sharing one input (MultiLinear / SlicedMultiLinear tables), one launch pair

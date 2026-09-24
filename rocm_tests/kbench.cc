@@ -1,3 +1,4 @@
+#include <chrono>
 #include <algorithm>
 // Standalone timing harness for exl3_rdna3_kernel (random trellis, correctness not checked)
 // build: hipcc -O3 --offload-arch=gfx1100 -I<ext>/quant -DKB_BITS=4 -DKB_MR=8 kbench.hip
@@ -33,28 +34,39 @@ int main(int argc, char** argv)
     std::vector<uint16_t> hs(std::max(k, n), 0x3c00); hipMemcpy(suh, hs.data(), k * 2, hipMemcpyHostToDevice); hipMemcpy(svh, hs.data(), n * 2, hipMemcpyHostToDevice);
 
     int groups = n / 128, kblocks = k / 128, row_chunks = (m + KB_MR - 1) / KB_MR;
+    auto kern = exl3_rdna3_kernel<bits, false, 2, KB_MR, false>;
     int splits = std::max(1, std::min(kblocks, (target + groups * row_chunks - 1) / (groups * row_chunks)));
     int kbps = (kblocks + splits - 1) / splits; splits = (kblocks + kbps - 1) / kbps;
-    auto kern = exl3_rdna3_kernel<bits, false, 2, KB_MR, false>;
+    int units = groups * splits * row_chunks;
+    dim3 grid(groups * splits, row_chunks);
+    Exl3Rdna3MTab mt {};
     auto launch = [&] {
-        exl3_rdna3_had_kernel<<<(m * kblocks + 7) / 8, 256, 0, 0>>>(A, suh, xh, xcs, m, k, nullptr, nullptr);
-        kern<<<dim3(groups * splits, row_chunks), EXL3_RDNA3_THREADS, 0, 0>>>(xh, B, C, m, k, n, counters, xcs, ws, svh, splits, kbps * 8, Exl3Rdna3MTab {});
+        exl3_rdna3_had_kernel<<<(m * kblocks + 7) / 8, 256, 0, 0>>>(A, suh, xh, xcs, m, k, nullptr, nullptr, Exl3Rdna3GNorm {});
+        kern<<<grid, EXL3_RDNA3_THREADS, 0, 0>>>(xh, B, C, m, k, n, counters, xcs, ws, svh, splits, kbps * 8, mt);
     };
-    for (int i = 0; i < 5; ++i) launch();
-    hipDeviceSynchronize();
+    // Warm up long enough for the clocks to leave their idle state (~0.3 s of back-to-back launches)
+    {
+        hipDeviceSynchronize();
+        auto t0 = std::chrono::steady_clock::now();
+        while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 0.3)
+        {
+            for (int i = 0; i < 20; ++i) launch();
+            hipDeviceSynchronize();
+        }
+    }
     hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
-    int it = 200;
+    int it = 1000;
     hipEventRecord(e0); for (int i = 0; i < it; ++i) launch(); hipEventRecord(e1); hipEventSynchronize(e1);
     float ms; hipEventElapsedTime(&ms, e0, e1);
     double us = ms * 1000 / it;
-    printf("bits=%d MR=%d m=%d k=%d n=%d splits=%d blocks=%d: %.1f us, %.1f GB/s\n", bits, KB_MR, m, k, n, splits, groups * splits * row_chunks, us, n_words * 4 / us / 1e3);
+    printf("bits=%d MR=%d m=%d k=%d n=%d splits=%d units=%d grid=%d: %.1f us, %.1f GB/s\n", bits, KB_MR, m, k, n, splits, units, (int) (grid.x * grid.y), us, n_words * 4 / us / 1e3);
 #ifdef KB_TRACE
     {
         // One isolated launch: block timeline relative to the earliest start (us, 100 MHz ticks)
         hipDeviceSynchronize();
         launch();
         hipDeviceSynchronize();
-        int nb = groups * splits * row_chunks;
+        int nb = (int) (grid.x * grid.y);
         std::vector<unsigned long long> t(3 * 8192);
         hipMemcpyFromSymbol(t.data(), HIP_SYMBOL(kb_trace), t.size() * 8);
         unsigned long long t0 = ~0ull, tend = 0;

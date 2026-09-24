@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <Python.h>
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -823,7 +824,17 @@ void BC_Attention::run_gr
         else
             mul_sigmoid_broadcast__gr(s.o4, g3, graph);
     }
-    else if (gate_mode == 2 || gate_mode == 3)
+    // RDNA3: the full output gate folds into o_proj's input transform (EXL3_FUSE_ACT=0 disables)
+    static const bool fuse_gate = !(std::getenv("EXL3_FUSE_ACT") && std::getenv("EXL3_FUSE_ACT")[0] == '0');
+    bool gate_fused = false;
+    if ((gate_mode == 2 || gate_mode == 3) && fuse_gate && hs == hidden_size && !o_proj->bias)
+    {
+        at::Tensor y2f = y.view({R, hidden_size});
+        gate_fused = exl3_gemm_silu_gr(s.o2, s.g2, o_proj->trellis, y2f, o_proj->suh, o_proj->svh,
+                                       o_proj->mcg, o_proj->mul1, graph, true);
+        if (gate_fused) return;
+    }
+    if (gate_mode == 2 || gate_mode == 3)
         mul_sigmoid__gr(s.o2, s.g2, graph);
 
     // Output projection. With a padded hidden dim the GEMM writes the padded static (N of the

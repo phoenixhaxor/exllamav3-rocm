@@ -106,5 +106,61 @@ for name, mode, prefixes in cases:
             t_fus = timeit(lambda: run(x, b, torch.half, outs, cp))
         print(f"  timing m={m}: separate {t_sep:7.1f} us, fused {t_fus:7.1f} us")
 
+# Fused prologues vs. the unfused kernels: silu(gate) * up -> down, gated RMSNorm -> o_proj
+down = load(f"{pre}.0.mlp.down_proj")
+oproj = load(f"{pre}.0.linear_attn.out_proj")
+for m in (1, 5, 8, 16):
+    kd = down.in_features
+    g = torch.randn((m, kd), dtype = torch.half, device = "cuda:0")
+    u = torch.randn((m, kd), dtype = torch.half, device = "cuda:0")
+    for c_dtype in (torch.half, torch.float):
+        a = torch.empty_like(g)
+        ext.silu_mul(g, u, a, 0.0)
+        ref = torch.empty((m, down.out_features), dtype = c_dtype, device = "cuda:0")
+        ext.exl3_gemm(a, down.inner.trellis, ref, down.inner.suh, torch.empty_like(a), down.inner.svh, -1, down.inner.mcg, down.inner.mul1, 0)
+        got = torch.empty_like(ref)
+        ok = ext.exl3_gemm_silu(g, u, down.inner.trellis, got, down.inner.suh, down.inner.svh, down.inner.mcg, down.inner.mul1)
+        torch.cuda.synchronize()
+        err = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
+        good = ok and err < 1e-6
+        fails += not good
+        print(f"  silu+down m={m:2d} {str(c_dtype)[6:]:7s} launched={ok} rel diff {err:.2e} {'OK' if good else 'FAIL'}")
+    ko = oproj.in_features
+    heads = ko // 128
+    x = torch.randn((m, heads, 128), dtype = torch.bfloat16, device = "cuda:0")
+    for w_dtype, z_dtype, act in ((torch.float, torch.float, 0), (torch.bfloat16, torch.bfloat16, 0), (torch.float, torch.float, 1)):
+        w = (torch.rand(128, device = "cuda:0") + 0.5).to(w_dtype)
+        z = torch.randn((m, heads, 128), dtype = z_dtype, device = "cuda:0")
+        y = torch.empty((m, heads, 128), dtype = torch.half, device = "cuda:0")
+        ext.gated_rms_norm(x, w, y, z, 1e-6, 0.0, 1, False, act)
+        ref = torch.empty((m, oproj.out_features), dtype = torch.half, device = "cuda:0")
+        y2 = y.view(m, ko)
+        ext.exl3_gemm(y2, oproj.inner.trellis, ref, oproj.inner.suh, torch.empty_like(y2), oproj.inner.svh, -1, oproj.inner.mcg, oproj.inner.mul1, 0)
+        got = torch.empty_like(ref)
+        ok = ext.exl3_gemm_gnorm(x, z, w, 1e-6, 0.0, act == 1, oproj.inner.trellis, got, oproj.inner.suh, oproj.inner.svh, oproj.inner.mcg, oproj.inner.mul1)
+        torch.cuda.synchronize()
+        err = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
+        good = ok and err < 1e-3
+        fails += not good
+        print(f"  gnorm+o_proj m={m:2d} w={str(w_dtype)[6:]} z={str(z_dtype)[6:]} act={act} launched={ok} rel diff {err:.2e} {'OK' if good else 'FAIL'}")
+
+aoproj = load(f"{pre}.3.self_attn.o_proj")
+for m in (1, 5, 8, 16):
+    ka = aoproj.in_features
+    o = torch.randn((m, ka), dtype = torch.half, device = "cuda:0")
+    gt = torch.randn((m, ka), dtype = torch.half, device = "cuda:0")
+    for c_dtype in (torch.half, torch.float):
+        og = o.clone()
+        ext.mul_sigmoid_(og, gt)
+        ref = torch.empty((m, aoproj.out_features), dtype = c_dtype, device = "cuda:0")
+        ext.exl3_gemm(og, aoproj.inner.trellis, ref, aoproj.inner.suh, torch.empty_like(og), aoproj.inner.svh, -1, aoproj.inner.mcg, aoproj.inner.mul1, 0)
+        got = torch.empty_like(ref)
+        ok = ext.exl3_gemm_sigmoid_gate(o, gt, aoproj.inner.trellis, got, aoproj.inner.suh, aoproj.inner.svh, aoproj.inner.mcg, aoproj.inner.mul1)
+        torch.cuda.synchronize()
+        err = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
+        good = ok and err < 1e-6
+        fails += not good
+        print(f"  gate+o_proj m={m:2d} {str(c_dtype)[6:]:7s} launched={ok} rel diff {err:.2e} {'OK' if good else 'FAIL'}")
+
 print("FAILS:", fails)
 sys.exit(1 if fails else 0)

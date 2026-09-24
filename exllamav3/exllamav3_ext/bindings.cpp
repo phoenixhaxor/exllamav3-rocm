@@ -161,6 +161,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
+    m.def("exl3_gemm_silu", [] (const at::Tensor& g, const at::Tensor& u, const at::Tensor& B, at::Tensor& C,
+                                const at::Tensor& suh, const at::Tensor& svh, bool mcg, bool mul1)
+          { return exl3_gemm_silu_gr(g, u, B, C, suh, svh, mcg, mul1, nullptr); }, "exl3_gemm_silu");
+    m.def("exl3_gemm_sigmoid_gate", [] (const at::Tensor& o, const at::Tensor& g, const at::Tensor& B, at::Tensor& C,
+                                        const at::Tensor& suh, const at::Tensor& svh, bool mcg, bool mul1)
+          { return exl3_gemm_silu_gr(o, g, B, C, suh, svh, mcg, mul1, nullptr, true); }, "exl3_gemm_sigmoid_gate");
+    m.def("exl3_gemm_gnorm", [] (const at::Tensor& x, const at::Tensor& g, const at::Tensor& w, float eps, float bias,
+                                 bool sigmoid, const at::Tensor& B, at::Tensor& C, const at::Tensor& suh,
+                                 const at::Tensor& svh, bool mcg, bool mul1)
+          { return exl3_gemm_gnorm_gr(x, g, w, eps, bias, sigmoid, B, C, suh, svh, mcg, mul1, nullptr); }, "exl3_gemm_gnorm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");

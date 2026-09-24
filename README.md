@@ -152,9 +152,13 @@ GEMV/GEMM kernels:
   `SlicedMultiLinear` pointer tables: MLP gate + up, Gated DeltaNet qkv + z (8 slices of 2048),
   attention q / k / v (14 slices of 1024). 3.3% less time per speculative round than separate matmuls
   (~320 fewer kernels per round; q/k/v alone is 26-28% faster at 5-8 rows).
-- Gated MLP: `silu(gate) * up` is computed inside the down projection's input transform (same fp16
-  rounding as `silu_mul`), one kernel less per MLP.
-- Grid sizing: the k-split targets one residency wave (3 blocks per CU, LDS-limited); a partial second
+- Input-transform prologues, each replacing a separate elementwise kernel: `silu(gate) * up` before
+  the MLP down projection (bit-identical to `silu_mul`), the attention output gate `o * sigmoid(g)`
+  before `o_proj` (bit-identical to `mul_sigmoid_`), and the Gated DeltaNet gated RMSNorm before
+  `out_proj` (one head = one 128-element Hadamard block; matches `gated_rms_norm` to fp16 rounding).
+- `mul1` pair packing with `v_sad_hi_u8` (the second byte sum lands in the high half directly): one
+  VALU op less per weight pair, ~2-4% faster decode matmuls.
+- Grid sizing: the k-split targets one residency wave (6 blocks per WGP = 288, LDS-limited); a partial second
   wave of blocks roughly doubles the kernel tail. 3-10% faster per matmul in isolation (`kbench`),
   neutral end-to-end.
 
@@ -183,6 +187,10 @@ verification from ~45 ms to ~14 ms per round.
 - Triton decode split kernel: skips keys before the sliding window (the DFlash2 draft scanned the whole
   context: 13 ms -> 1.2 ms per round at 100K).
 - `gdn_ba_gemv`: 16-byte loads and `v_dot2` with independent accumulators.
+- Gated DeltaNet recurrence (`gdn.cu`): for 128x128 heads the state slice of each thread stays in
+  registers across the drafted tokens, instead of being read from memory twice per token (the state
+  is 3 MB per layer). 2.5 -> 1.7 ms per speculative round, bit-identical; it is now bound by the
+  per-token history writes needed for rollback.
 - Residual adds: a transformer block hands its final `x += mlp(x)` to the next block's input RMSNorm
   (`rms_norm_res_in`, already used between attention and MLP), removing ~58 elementwise kernels per
   round.
@@ -194,9 +202,11 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_RDNA3_GEMM` | 1 | 0 = fall back to the (emulated) upstream EXL3 kernels |
 | `EXL3_RDNA3_ATTN` | 1 | 0 = Triton decode attention |
 | `EXL3_RDNA3_ATTN_SPLIT_MULT` | 16 | kv splits per CU for the HIP attention kernels (cap 128) |
-| `EXL3_RDNA3_TARGET_BLOCKS` | 3 x CUs | grid size target for the EXL3 matmul k-split |
+| `EXL3_RDNA3_TARGET_BLOCKS` | 6 x WGPs (288) | grid size target for the EXL3 matmul k-split |
 | `EXL3_HIP_MGEMM` | 1 | 0 = run bundled projections (gate/up, qkv/z, q/k/v) as separate matmuls |
-| `EXL3_FUSE_ACT` | 1 | 0 = separate `silu_mul` kernel before the MLP down projection |
+| `EXL3_FUSE_ACT` | 1 | 0 = separate `silu_mul` / `mul_sigmoid_` kernels before the MLP down projection / attention `o_proj` |
+| `EXL3_FUSE_GNORM` | 1 | 0 = separate gated RMSNorm kernel before the DeltaNet `out_proj` |
+| `EXL3_GDN_REG` | 1 | 0 = original DeltaNet recurrence kernel (state re-read from memory per token) |
 | `EXL3_RESID_DEFER` | 1 | 0 = no residual-add folding into the next block's input norm |
 | `EXL3_NOGRAPH` | - (`mlp,gdn` in `run_tabbyapi.sh`) | modules (`mlp`, `gdn`, `attn`) that decode eagerly instead of through a HIP graph |
 | `EXL3_PF_BLOCK_M`, `EXL3_PF_BLOCK_N`, `EXL3_PF_WARPS` | - | Triton prefill tile overrides |
@@ -206,12 +216,12 @@ verification from ~45 ms to ~14 ms per round.
 | Script | Purpose |
 |---|---|
 | `test_rdna3_gemm.py <model_dir> [tensor ...]` | EXL3 matmul vs. reconstructed weights (m = 1..144, fp16/fp32 out) and an independent numpy trellis decoder |
-| `test_rdna3_mgemm.py <model_dir>` | multi-matrix matmul (gate/up, sliced qkv/z and q/k/v) vs. separate matmuls, with timing |
-| `gaps.py -m <model> [-dm <draft>]` | GPU busy/idle per speculative round, gap histogram, kernel counts and times |
+| `test_rdna3_mgemm.py <model_dir>` | multi-matrix matmul (gate/up, sliced qkv/z and q/k/v) and the fused prologues (silu, output gate, gated norm) vs. the unfused kernels |
+| `gaps.py -m <model> [-dm <draft>] [--stack]` | GPU busy/idle per speculative round, gap histogram, kernel counts and times; `--stack`: CPU activity inside large GPU gaps |
 | `bench_gen.py -m <model> [-dm <draft> \| --mtp]` | short-prompt generation speed, draft acceptance, `--image` for vision |
 | `bench_long.py 2000,32000,99000 [-dm <draft> \| --mtp]` | decode speed after long prompts (greedy, prints output with `--show`) |
 | `prof_gen.py`, `prof_long.py`, `prof_prefill.py` | kernel-time breakdowns (torch.profiler) |
-| `kbench.cc` | standalone EXL3 matmul timing harness (`hipcc -x hip`; `-DKB_TRACE` prints a per-block timeline) |
+| `kbench.cc` | standalone EXL3 matmul timing harness (`hipcc -x hip`; warms the clocks first; `-DKB_TRACE` prints a per-block timeline) |
 | `attn_pf_bench.py` | prefill attention microbenchmark with a torch reference |
 | `api_test.py <url> <image>`, `needle_api.py <n> <depth>` | OpenAI API smoke test, long-context retrieval |
 | `vram.py <ctx> <kv_bits> <draft_kv_bits>` | VRAM per component |

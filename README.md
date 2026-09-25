@@ -21,19 +21,20 @@ Decode speed, greedy, code-style prompt, 8-bit KV cache (DFlash2 draft KV 4-bit)
 
 | Context | DFlash2 (default) | MTP | No draft |
 |---|---|---|---|
-| 2K | **152 tok/s** | 111 tok/s | 38.5 tok/s |
-| 32K | **143 tok/s** | 93 tok/s | 36.3 tok/s |
-| 99K | **107 tok/s** | 68 tok/s | - |
+| 2K | **153 tok/s** | 108 tok/s | 38.5 tok/s |
+| 32K | **143 tok/s** | 92 tok/s | 36.3 tok/s |
+| 99K | **104-107 tok/s** | 66-68 tok/s | - |
 
-(No-draft column measured before the kernel-fusion rounds.)
+(No-draft column measured before the kernel-fusion rounds. Re-measured after the megakernel round: the
+per-round gain on the plain model, ~2%, is within the run-to-run spread of draft acceptance.)
 
 Short prompts, 512 generated tokens, greedy (`rocm_tests/bench_gen.py`):
 
 | Workload | DFlash2 | MTP (3 draft tokens) |
 |---|---|---|
-| Code | 134 tok/s | 101 tok/s |
-| Explanation | 98 tok/s | 82 tok/s |
-| Prose / story | 70 tok/s | 73 tok/s |
+| Code | 130-134 tok/s | 101-108 tok/s |
+| Explanation | 94-98 tok/s | 81-82 tok/s |
+| Prose / story | 70 tok/s | 70-73 tok/s |
 
 Run-to-run variance is noticeable (occasional runs 10-20% slower); profiling shows the extra time is host
 side (GPU idle between launches), not in the kernels.
@@ -222,6 +223,10 @@ verification from ~45 ms to ~14 ms per round.
 |---|---|
 | `test_rdna3_gemm.py <model_dir> [tensor ...]` | EXL3 matmul vs. reconstructed weights (m = 1..144, fp16/fp32 out) and an independent numpy trellis decoder |
 | `test_rdna3_mgemm.py <model_dir>` | multi-matrix matmul (gate/up, sliced qkv/z and q/k/v) and the fused prologues (silu, output gate, gated norm) vs. the unfused kernels |
+| `bench_ab.py -m <model> -dm <draft> [--variants ...]` | in-process A/B of decode-loop options at fixed greedy acceptance: median ms per speculative round (the reliable speed metric) |
+| `bw.py -m <model> [-dm <draft>] [--rows]` | practical peak bandwidth vs every EXL3 matmul at 1 / 8 rows, per projection kind; `--rows`: whole-pass scaling 1-16 rows |
+| `timeline.py -m <model> -dm <draft> [--stack] [--ops]` | GPU ops and large gaps inside individual rounds, with the CPU frames running during each gap |
+| `test_gdn_mk.py`, `test_presample.py`, `test_abl_fuse.py`, `test_abl_noise.py` | bit-identity / numerics checks for the megakernel, batched sampling and runtime ablation |
 | `gaps.py -m <model> [-dm <draft>] [--stack]` | GPU busy/idle per speculative round, gap histogram, kernel counts and times; `--stack`: CPU activity inside large GPU gaps |
 | `bench_gen.py -m <model> [-dm <draft> \| --mtp]` | short-prompt generation speed, draft acceptance, `--image` for vision |
 | `bench_long.py 2000,32000,99000 [-dm <draft> \| --mtp]` | decode speed after long prompts (greedy, prints output with `--show`) |
@@ -250,15 +255,16 @@ produces the same text as plain decoding for the DFlash2 path in these tests.
 
 ### Where the time goes
 
-One DFlash2 speculative round (draft forward + 8-token verification) takes ~39 ms on the 7900 XTX
-(measured with `rocm_tests/gaps.py`, 60 rounds, short context):
+One DFlash2 speculative round (draft forward + 8-token verification) takes ~35.9 ms on the 7900 XTX
+after the rounds below (it was ~39 ms before the megakernel / host-side round; profile with
+`rocm_tests/gaps.py`, wall-clock A/B with `rocm_tests/bench_ab.py`):
 
 | Part | Time per round | Notes |
 |---|---|---|
-| EXL3 matmuls | ~26 ms | 8 rows (verification) and the draft; VALU- and latency-bound (see below) |
-| Gated DeltaNet recurrence | ~1.7 ms | 48 layers; latency-bound, plus per-token history writes for rollback |
-| Attention, norms, other kernels | ~5 ms | |
-| GPU idle | ~6 ms (16%) | ~984 kernel launches x ~3.3 us dispatch gap, plus host turnaround after the verification sync |
+| EXL3 matmuls | ~26 ms | verification (8 rows) + draft + two lm_head passes; decode-VALU-bound at 8 rows (see below) |
+| Gated DeltaNet core (`gdn_core_mk`) | ~2.3 ms | 48 layers; recurrence latency-bound, plus per-token history writes for rollback |
+| Attention, norms, other kernels | ~4 ms | |
+| GPU idle | ~3.4 ms (~10%) | ~690 dispatch gaps of ~3-4.5 us between dependent kernels (~718 kernels per round) |
 
 The 8-row matmul costs ~1.4x a 1-row matmul. The `mul1` codebook decode (a hash plus byte sum per
 weight, ~5 VALU ops) and the 8-row FMA (`v_dot2`, dual-issued) share one issue port, and the loop is
@@ -286,11 +292,44 @@ each graph launch adds ~8 us of GPU idle. Replacing the per-module graphs with e
 | GPU-side embedding gather from pinned host memory | the CPU lookup is only ~0.1 ms per round |
 | 3.0 bpw main model | not faster (decode cost is per weight) and lower quality |
 | Dynamic draft length, hot-token (vocabulary-pruned) draft head | slower end-to-end |
+| Cooperative launch (`grid.sync`) for the DeltaNet megakernel | +10-20 us per launch on ROCm, ate the gain; replaced by a normal launch with an atomic epoch barrier |
+| "Host turnaround" after the verification sync | mostly a profiler artifact (long kernels are under-reported); batched sampling and non-blocking readbacks recovered only ~0.3 ms |
+| ROCm 10.0 | same speed as 7.2.4 (see below) |
+
+### Memory bandwidth utilization
+
+Measured with `rocm_tests/bw.py` (event timing, each EXL3 matmul of the model run in isolation):
+
+| | Bandwidth | Share of practical peak |
+|---|---|---|
+| Practical peak, large read-only reduction / device copy | 750 / 701 GB/s | (spec 960 GB/s) |
+| All matmuls, 1 row (plain decode) | 649 GB/s | 87% |
+| All matmuls, 8 rows (speculative verification) | 437-450 GB/s | ~60% |
+| Whole round: ~13.6 GB of weights (target 11.6, draft 1.1, draft-side lm_head 0.95) per ~36 ms | ~380 GB/s | ~50% |
+
+A full pass over the 401 target matmuls, by rows:
+
+| Rows | Pass | Per row | Effective bandwidth |
+|---|---|---|---|
+| 1 | 17.9 ms | 17.9 ms | 649 GB/s |
+| 2 | 19.0 ms | 9.5 ms | 610 GB/s |
+| 4 | 21.6 ms | 5.4 ms | 538 GB/s |
+| 8 | 26.6 ms | 3.3 ms | 437 GB/s |
+| 16 | 42.2 ms | 2.6 ms | 275 GB/s |
+
+Up to two rows the matmul is bandwidth-bound; beyond that the per-weight codebook decode (hash + byte
+sum, ~5 VALU ops) plus the row FMAs, which share one issue port, dominate. So bandwidth is close to
+saturated for plain decode but not for verification: a purely bandwidth-bound round would take ~18 ms
+(13.6 GB at 750 GB/s) against ~36 ms now, the difference being the 8-row decode compute (~8 ms), the
+remaining dispatch gaps (~3.4 ms) and the non-matmul kernels (~6 ms). Per-kind utilization is even
+(420-590 GB/s at 8 rows); tiny matrices (k/v projections, 124 GB/s alone) run inside the sliced qkv
+bundle at runtime, so there is no single badly-served projection left.
 
 ### Megakernel and host-side round
 
 Measured in-process with `rocm_tests/bench_ab.py` (greedy, variants interleaved per prompt, median
-ms per speculative round): **38.0 -> 35.9 ms per round**. All kernel changes are bit-identical to the
+ms per speculative round): **38.0 -> 35.9 ms per round (-5.5%) with the abliterated (runtime-ablation)
+model, 36.7 -> 35.9 ms (-2%) with the plain model**, which never ran the ablation kernel. All kernel changes are bit-identical to the
 kernels they replace (`rocm_tests/test_gdn_mk.py`, `test_presample.py`).
 
 | Change | Effect | Switch |
@@ -327,6 +366,8 @@ Estimated gains are per speculative round (~36 ms); each is small, which is why 
 | Idea | Estimated gain | Notes |
 |---|---|---|
 | Residual RMSNorm + input transform as a prologue of the next matmul | ~0.3-0.5 ms (-128 kernels) | GEMM blocks may only wait on lower block ids; needs a pending-norm hand-off with a flush for non-RDNA3 consumers of the norm output |
+| Lower-bit copy of lm_head for the draft only | up to ~0.8 ms | the draft needs only the top-k per row over the full vocabulary; a 3-bit head (~0.45 GB instead of 0.95 GB) keeps the ordering mostly; verification stays exact, the cost is some acceptance. Needs requantizing the head (ROCm quantization kernels untested) |
+| Cheaper 8-row decode | up to ~8 ms (the compute share at 8 rows) | the matmul is decode-VALU-bound beyond 2 rows; every attempt so far (WMMA, split accumulators, more waves, in-kernel Hadamard) lost; a decode that shares work across rows or a codebook LUT in LDS would be the next thing to try |
 | Per-layer megakernel including the EXL3 matmuls | up to ~1.5 ms | `exl3_rdna3_unit` is already a device function; needs its LDS in one union and 256- vs 128-thread stages reconciled, at the risk of slowing the matmuls |
 | Parallelize the RMSNorm input-transform tail | ~0.3 ms | `rms_norm_had` runs one block per row (8 blocks at 8 rows) and got ~2 us slower per call |
 | Attention: fuse RoPE + paged KV update + q/g deinterleave | ~0.1-0.15 ms (-32..48 kernels) | 16 attention layers |

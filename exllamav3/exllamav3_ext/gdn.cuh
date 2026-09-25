@@ -248,3 +248,35 @@ struct StateRewindJob
 
 void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index);
 void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_index);
+
+bool gdn_core_mk
+(
+    const at::Tensor& x,
+    const at::Tensor& ba_w_t,
+    const c10::optional<at::Tensor>& ba_bias,
+    at::Tensor& ba,
+    const at::Tensor& qkv,
+    at::Tensor& conv_state,
+    const at::Tensor& slots,
+    const at::Tensor& conv_w,
+    const c10::optional<at::Tensor>& conv_b,
+    at::Tensor& conv_out,
+    const at::Tensor& dt_bias,
+    const at::Tensor& a_log,
+    float beta_scale,
+    at::Tensor& recurrent_state,
+    at::Tensor& core_attn_out,
+    int num_k_heads,
+    int num_v_heads,
+    int k_head_dim,
+    int v_head_dim,
+    bool history,
+    const c10::optional<at::Tensor>& o_suh,
+    const c10::optional<at::Tensor>& gn_w,
+    const c10::optional<at::Tensor>& gn_g,
+    float gn_eps,
+    float gn_bias,
+    bool gn_sigmoid
+);
+
+void gdn_mk_set(int enable);

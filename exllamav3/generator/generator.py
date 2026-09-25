@@ -13,6 +13,9 @@ from ..util.memory import malloc_trim
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
+import os
+_presample_enable = os.environ.get("EXL3_PRESAMPLE", "1") != "0"
+_draft_nb_enable = os.environ.get("EXL3_DRAFT_NB", "1") != "0"
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -892,7 +895,10 @@ class Generator:
                 return None
             window = w_used
 
-        self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
+        # Stream-ordered readback: a blocking copy into pinned memory idles the GPU for ~0.25 ms on ROCm
+        self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window], non_blocking = _draft_nb_enable)
+        if _draft_nb_enable:
+            torch.cuda.current_stream(new_ids.device).synchronize()
         return self.draft_ids_pinned[:, :window]
 
 
@@ -1154,17 +1160,43 @@ class Generator:
         # position n gates position n+1, and constrained-decoding masks and sampling past IDs
         # must advance between positions.
         else:
+            # Jobs whose sampling state can't change inside the window sample every verified position in one
+            # batched launch, and all of them come back with a single synchronize, instead of one sampler
+            # launch plus a blocking readback per position
+            presampled = {}
+            if draft_tokens is not None and _presample_enable:
+                launched = []
+                for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
+                    if a == b or b - a != 1 or not job.can_presample_window(): continue
+                    launched.append((idx, job.presample_window(batch_logits[a:b, :, :])))
+                if launched:
+                    width = batch_logits.shape[1]
+                    staging = self._staging("presample", len(launched), width, torch.long)
+                    for k, (idx, s_) in enumerate(launched):
+                        staging[k:k + 1].copy_(s_.view(1, width), non_blocking = True)
+                    torch.cuda.synchronize(batch_logits.device)
+                    for k, (idx, _) in enumerate(launched):
+                        presampled[idx] = staging[k:k + 1].clone()
+
             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
                 accepted_length = 1
                 rejected = 0
+                pre = presampled.get(idx)
 
                 for i in range(batch_logits.shape[1]):
                     token_logits = job_logits[:, i:i + 1, :]
-                    next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
-                        token_logits,
-                    )
+                    # A banned-string checkpoint opened inside the window can block tokens at later
+                    # positions: sample those one at a time again
+                    if pre is not None and job.checkpoint is not None:
+                        pre = None
+                    if pre is not None:
+                        next_token, next_k_tokens, next_k_probs, next_prob = pre[:, i:i + 1], None, None, None
+                    else:
+                        next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
+                            token_logits,
+                        )
                     eos, sampled_token, rq = job.receive_sample(
                         token_logits,
                         next_token,

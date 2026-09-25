@@ -187,6 +187,15 @@ struct RmsHadTail
     int num_src;
 };
 
+// Optional directional ablation of the incoming fp32 sublayer output in RES_IN mode (see ablate.cu):
+// x <- x * s - b * <x, a> before the residual add
+struct RmsAbl
+{
+    const float* a;            // null: no ablation
+    const float* b;
+    const float* s;            // optional
+};
+
 template <int res_mode, typename input_t, typename output_t, typename weight_t, typename residual_t>
 __global__ __launch_bounds__(NUM_THREADS)
 void rms_norm_kernel
@@ -201,7 +210,8 @@ void rms_norm_kernel
     const float constant_bias,
     const float constant_scale,
     const int w_groups,         // weight spans w_groups rows, cycled by row index (grouped norm)
-    const RmsHadTail tail
+    const RmsHadTail tail,
+    const RmsAbl abl
 )
 {
     constexpr bool input_fp32 = std::is_same_v<input_t, float>;
@@ -294,6 +304,54 @@ void rms_norm_kernel
         if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row_off)) + column);
     };
 
+    // Ablation: t = <x, a> over the row first (its own reduction), applied as each x4 is read below
+    constexpr bool can_abl = input_fp32 && res_mode == RES_IN;
+    float abl_t = 0.0f;
+    if constexpr (can_abl)
+    {
+        if (abl.a)
+        {
+            float d = 0.0f;
+            for (int column = t; column < columns; column += blockDim.x)
+            {
+                float4 x4, a4;
+                read_float4(x4, ((const float4*) (x + row_off)) + column);
+                read_float4(a4, ((const float4*) abl.a) + column);
+                d = fmaf(x4.x, a4.x, d);
+                d = fmaf(x4.y, a4.y, d);
+                d = fmaf(x4.z, a4.z, d);
+                d = fmaf(x4.w, a4.w, d);
+            }
+            abl_t = reduce_dyn(d, warp_id, lane_id);
+            __syncthreads();   // reduce_dyn's shared partials are reused by the norm reduction
+        }
+    }
+
+    auto apply_abl = [&] (float4& x4, int column)
+    {
+        if constexpr (can_abl)
+        {
+            if (abl.a)
+            {
+                float4 b4;
+                read_float4(b4, ((const float4*) abl.b) + column);
+                if (abl.s)
+                {
+                    float4 s4;
+                    read_float4(s4, ((const float4*) abl.s) + column);
+                    x4.x *= s4.x;
+                    x4.y *= s4.y;
+                    x4.z *= s4.z;
+                    x4.w *= s4.w;
+                }
+                x4.x = fmaf(-b4.x, abl_t, x4.x);
+                x4.y = fmaf(-b4.y, abl_t, x4.y);
+                x4.z = fmaf(-b4.z, abl_t, x4.z);
+                x4.w = fmaf(-b4.w, abl_t, x4.w);
+            }
+        }
+    };
+
     if (single)
     {
         // One float4 per thread: keep the value in a register between the two phases
@@ -302,6 +360,7 @@ void rms_norm_kernel
         if (t < columns)
         {
             read_in(x4, x + row_off + 4 * t);
+            apply_abl(x4, t);
             if constexpr (res_mode == RES_IN) add_resid_in(x4, t);
             sum = sum_sq4(sum, x4);
         }
@@ -317,6 +376,7 @@ void rms_norm_kernel
         {
             float4 x4;
             read_in(x4, x + row_off + 4 * column);
+            apply_abl(x4, column);
             if constexpr (res_mode == RES_IN) add_resid_in(x4, column);
             sum = sum_sq4(sum, x4);
         }
@@ -384,7 +444,8 @@ void rms_norm_impl
     int res_mode,
     Graph* graph = nullptr,
     int w_groups = 1,
-    RmsHadTail tail = {}
+    RmsHadTail tail = {},
+    RmsAbl abl = {}
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -430,6 +491,12 @@ void rms_norm_impl
     for (int i = 0; i < x.dim() - 1; ++i) rows *= x.size(i);
     int dim = x.size(-1);
 
+    if (abl.a)
+    {
+        TORCH_CHECK(res_mode == RES_IN && tx == at::kFloat && x.is_contiguous(),
+                    "rms_norm: ablation requires RES_IN with contiguous fp32 input");
+    }
+
     // Size the block to the row so short rows don't idle warps through the reduction
     int threads = MIN(NUM_THREADS, CEIL_DIVIDE(dim / 4, 32) * 32);
 
@@ -453,7 +520,8 @@ void rms_norm_impl
             constant_bias,                                                          \
             constant_scale,                                                         \
             w_groups,                                                               \
-            tail                                                                    \
+            tail,                                                                   \
+            abl                                                                     \
         );
 
     //      x_type________ w_type_____________  y_type_______        mode      r_type
@@ -538,6 +606,29 @@ void rms_norm_gr
     rms_norm_impl(x, w, y, {}, epsilon, constant_bias, constant_scale, false, RES_NONE, graph);
 }
 
+static RmsAbl make_abl
+(
+    const at::Tensor& x,
+    const c10::optional<at::Tensor>& abl_a,
+    const c10::optional<at::Tensor>& abl_b,
+    const c10::optional<at::Tensor>& abl_s
+)
+{
+    if (!abl_a.has_value()) return {};
+    const int64_t dim = x.size(-1);
+    TORCH_CHECK(abl_b.has_value(), "rms_norm: ablation needs a and b");
+    TORCH_CHECK(abl_a->dtype() == at::kFloat && abl_a->numel() == dim && abl_a->is_contiguous(), "rms_norm: bad abl a");
+    TORCH_CHECK(abl_b->dtype() == at::kFloat && abl_b->numel() == dim && abl_b->is_contiguous(), "rms_norm: bad abl b");
+    if (abl_s.has_value())
+        TORCH_CHECK(abl_s->dtype() == at::kFloat && abl_s->numel() == dim && abl_s->is_contiguous(), "rms_norm: bad abl s");
+    return
+    {
+        (const float*) abl_a->data_ptr(),
+        (const float*) abl_b->data_ptr(),
+        abl_s.has_value() ? (const float*) abl_s->data_ptr() : nullptr
+    };
+}
+
 // RMSNorm (optionally with the fused pre-norm residual add, r += x) whose tail also writes the RDNA3
 // EXL3 matmul input transform of y for the num_src matrices of a MultiLinear / SlicedMultiLinear
 // (suh_tab). The next exl3_mgemm on y with that table then skips its input kernel. Returns false
@@ -552,7 +643,10 @@ bool rms_norm_had
     float constant_bias,
     float constant_scale,
     at::Tensor suh_tab,
-    int num_src
+    int num_src,
+    c10::optional<at::Tensor> abl_a,
+    c10::optional<at::Tensor> abl_b,
+    c10::optional<at::Tensor> abl_s
 )
 {
     #ifdef __HIP_PLATFORM_AMD__
@@ -565,7 +659,8 @@ bool rms_norm_had
         if (!exl3_rdna3_prepare_input(x.device().index(), y.data_ptr(), suh_tab.data_ptr(), rows, dim, num_src, &xh, &xcs))
             return false;
         RmsHadTail tail { (const uint64_t*) suh_tab.data_ptr(), xh, xcs, num_src };
-        rms_norm_impl(x, w, y, r, epsilon, constant_bias, constant_scale, false, r ? RES_IN : RES_NONE, nullptr, 1, tail);
+        rms_norm_impl(x, w, y, r, epsilon, constant_bias, constant_scale, false, r ? RES_IN : RES_NONE, nullptr, 1, tail,
+                      make_abl(x, abl_a, abl_b, abl_s));
         return true;
     #else
         return false;
@@ -581,10 +676,14 @@ void rms_norm_res_in
     at::Tensor r,
     float epsilon,
     float constant_bias,
-    float constant_scale
+    float constant_scale,
+    c10::optional<at::Tensor> abl_a,
+    c10::optional<at::Tensor> abl_b,
+    c10::optional<at::Tensor> abl_s
 )
 {
-    rms_norm_impl(x, w, y, r, epsilon, constant_bias, constant_scale, false, RES_IN);
+    rms_norm_impl(x, w, y, r, epsilon, constant_bias, constant_scale, false, RES_IN, nullptr, 1, {},
+                  make_abl(x, abl_a, abl_b, abl_s));
 }
 
 

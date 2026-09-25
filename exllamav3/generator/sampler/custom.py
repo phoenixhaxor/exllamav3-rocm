@@ -1131,14 +1131,15 @@ class CustomSampler(Sampler):
         # fp32 logits to the fused step, which already accepts -inf entries from the logit mask
         # and the padded vocabulary region. Ineligible stacks fall through to the step-by-step
         # path.
+        # Requirements come from the simplified steps: a neutral penalty (no-op) needs no past IDs
         simplified = []
         for step in steps:
-            self.reqs_past_ids = self.reqs_past_ids or step.reqs_past_ids()
-            self.reqs_torch_seed = self.reqs_torch_seed or step.reqs_torch_seed()
             alt = step.alt()
             if alt:
                 step = alt
             if not isinstance(step, SS_NoOp):
+                self.reqs_past_ids = self.reqs_past_ids or step.reqs_past_ids()
+                self.reqs_torch_seed = self.reqs_torch_seed or step.reqs_torch_seed()
                 simplified.append(step)
 
         head = []

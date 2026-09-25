@@ -339,7 +339,11 @@ class Model_LSMixin(ABC):
             x = module.forward(x, params)
         params.pop("resid_defer", None)
         pending = params.pop("resid_pending", None)
+        pending_abl = params.pop("resid_pending_abl", None)
         if pending is not None:
+            if pending_abl is not None:
+                from ..modules.transformer import apply_ablation
+                apply_ablation(pending, pending_abl)
             x += pending
         return x
 

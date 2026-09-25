@@ -152,6 +152,9 @@ bool exl3_rdna3_gemm
 {
     #ifdef __HIP_PLATFORM_AMD__
         if (!exl3_rdna3_enabled()) return false;
+        // A producer may have written this launch's transformed input already (exl3_rdna3_prepare_input
+        // with suh as the table, one source): then skip the input kernel. Either way the record is spent
+        const Prepared pr = g_prepared[device];
         g_prepared[device].A = nullptr;   // this launch overwrites the input workspace
         if (!suh || !svh) return false;
         if (size_k % 128 || size_n % 128) return false;
@@ -190,8 +193,11 @@ bool exl3_rdna3_gemm
             choose_splits(groups * row_chunks, kblocks, (size_t) m * size_n * sizeof(float), device, splits, ks_per_split);
 
             const int had_tasks = m * kblocks;
-            exl3_rdna3_had_kernel<<<(had_tasks + 7) / 8, 256, 0, stream>>>(A_r, suh, xh, xcs, m, size_k, nullptr, A_up ? A_up + (size_t) r0 * size_k : nullptr,
-                                                                           gn ? *gn : Exl3Rdna3GNorm {});
+            const bool prepared = !graph && r0 == 0 && m == size_m && pr.A == (const void*) A &&
+                                  pr.suh_tab == (const void*) suh && pr.m == size_m && pr.k == size_k && pr.num_src == 1;
+            if (!prepared)
+                exl3_rdna3_had_kernel<<<(had_tasks + 7) / 8, 256, 0, stream>>>(A_r, suh, xh, xcs, m, size_k, nullptr, A_up ? A_up + (size_t) r0 * size_k : nullptr,
+                                                                               gn ? *gn : Exl3Rdna3GNorm {});
             kernel<<<dim3(groups * splits, row_chunks), EXL3_RDNA3_THREADS, 0, stream>>>
             (
                 xh, B32, C_r, m, size_k, size_n, counters, xcs, ws, svh, splits, ks_per_split, Exl3Rdna3MTab {}

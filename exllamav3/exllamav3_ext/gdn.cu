@@ -2212,3 +2212,581 @@ void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_in
         cuda_check(cudaPeekAtLastError());
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// GDN core "megakernel" for decode/verification (bsz 1, 128x128 heads, per-head decay): one
+// cooperative launch runs
+//   stage 1: the merged b/a GEMV (one warp per output) and the causal conv update, which reads the
+//            fp32 qkv projection directly (the bf16 cast of gated_delta_net_fused_op_3),
+//   grid-wide barrier,
+//   stage 2: the register-resident recurrence, computing beta and g of its head inline from b/a
+// in place of gdn_ba_gemv + gated_delta_net_fused_op_3 + conv1d_update + recurrence (four
+// launches and three dispatch gaps per layer). Same arithmetic as those kernels, term for term.
+
+#ifdef __HIP_PLATFORM_AMD__
+
+#ifndef MAX_DEVICES
+#define MAX_DEVICES 16
+#endif
+
+#include "quant/exl3_rdna3.cuh"
+#include "quant/exl3_rdna3_had.cuh"
+
+// Grid-wide barrier for a normally launched kernel whose blocks are all co-resident (the caller keeps the
+// grid far below one wave of residency). Single use per launch: the last block to arrive resets the counter
+// and publishes this launch's epoch, which the host advances every launch, so no reset kernel is needed
+__device__ __forceinline__ void gdn_mk_grid_barrier(unsigned* bar, unsigned epoch)
+{
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        unsigned prev = __hip_atomic_fetch_add(&bar[0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        if (prev == gridDim.x - 1)
+        {
+            __hip_atomic_store(&bar[0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_store(&bar[1], epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        }
+        else
+        {
+            while (__hip_atomic_load(&bar[1], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) != epoch)
+                __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+    __threadfence();
+}
+
+struct GdnCoreArgs
+{
+    // b/a GEMV
+    const half* x;                  // [R, k]
+    const half* ba_w_t;             // [n_ba, k]
+    const half* ba_bias;            // [n_ba] or null
+    float* ba;                      // [R, n_ba]
+    int k;
+    int n_ba;
+    int R;
+    // conv update
+    const float* qkv;               // [B, S, F] fp32
+    bfloat16* conv_state;           // [slots, F, state_size]
+    const int* slots;               // [B] or null
+    const bfloat16* conv_w;         // [F, K]
+    const bfloat16* conv_b;         // [F] or null
+    bfloat16* conv_out;             // [B, S, F]
+    int B;
+    int F;
+    int S;
+    int state_size;
+    int K;
+    // beta / g
+    const bfloat16* dt_bias;        // [H]
+    const float* a_log_f;           // [H] fp32, or
+    const bfloat16* a_log_bf;       // [H] bf16
+    float beta_scale;
+    // recurrence
+    float* recurrent_state;
+    bfloat16* core_attn_out;        // [B, S, H, 128]
+    int num_k_heads;
+    int num_v_heads;
+    float scale;
+    int history_stride;
+    // grid barrier
+    unsigned* bar;
+    unsigned epoch;
+    // optional epilogue: o_proj input transform with the gated RMSNorm (exl3_rdna3_had_kernel, GN path),
+    // done per head by the last of its four recurrence blocks
+    unsigned* head_cnt;             // [B * H], zero between launches
+    uint2* o_xh;                    // null: no epilogue
+    float* o_xcs;
+    const half* o_suh;
+    Exl3Rdna3GNorm gn;
+    const void* gn_g;               // gate (z), [B, S, H, 128]
+};
+
+// One (row m, head c) task of exl3_rdna3_had_kernel with an active gated RMSNorm, same arithmetic
+__device__ __forceinline__ void gdn_mk_gnorm_had_task(const GdnCoreArgs& a, int m, int c, int lane)
+{
+    const int size_k = a.num_v_heads * 128;
+    const int kbase = c * 128;
+    const Exl3Rdna3GNorm& gn = a.gn;
+    auto bf = [] (uint32_t v, int hi) { return __uint_as_float(hi ? (v & 0xffff0000u) : (v << 16)); };
+    const size_t off = (size_t) m * size_k + kbase + lane * 4;
+    const uint2 xr = *(const uint2*) (((const uint16_t*) a.core_attn_out) + off);
+    float f[4] = { bf(xr.x, 0), bf(xr.x, 1), bf(xr.y, 0), bf(xr.y, 1) };
+    float ss = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) ss = fmaf(f[i], f[i], ss);
+    #pragma unroll
+    for (int i = 16; i > 0; i >>= 1) ss += __shfl_xor(ss, i);
+    const float rmf = rsqrtf(ss / 128.0f + gn.eps);
+    float w[4], g[4];
+    if (gn.flags & GN_W_BF16)
+    {
+        const uint2 wr = *(const uint2*) (((const uint16_t*) gn.w) + lane * 4);
+        w[0] = bf(wr.x, 0); w[1] = bf(wr.x, 1); w[2] = bf(wr.y, 0); w[3] = bf(wr.y, 1);
+    }
+    else
+    {
+        const float4 wr = *(const float4*) (((const float*) gn.w) + lane * 4);
+        w[0] = wr.x; w[1] = wr.y; w[2] = wr.z; w[3] = wr.w;
+    }
+    if (gn.flags & GN_G_BF16)
+    {
+        const uint2 gr = *(const uint2*) (((const uint16_t*) a.gn_g) + off);
+        g[0] = bf(gr.x, 0); g[1] = bf(gr.x, 1); g[2] = bf(gr.y, 0); g[3] = bf(gr.y, 1);
+    }
+    else
+    {
+        const float4 gr = *(const float4*) (((const float*) a.gn_g) + off);
+        g[0] = gr.x; g[1] = gr.y; g[2] = gr.z; g[3] = gr.w;
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        const float wi = gn.bias != 0.0f ? w[i] + gn.bias : w[i];
+        float v = f[i] * wi * rmf;
+        const float r = __fdividef(1.0f, 1.0f + __expf(-g[i]));
+        v *= (gn.flags & GN_SIGMOID) ? r : g[i] * r;
+        f[i] = v;
+    }
+    const half2 x01 = __floats2half2_rn(f[0], f[1]);
+    const half2 x23 = __floats2half2_rn(f[2], f[3]);
+    exl3_rdna3_had::transform_block(x01, x23, a.o_suh, a.o_xh, a.o_xcs, m, c, size_k, lane);
+}
+
+__device__ __forceinline__ void gdn_mk_ba_task(const GdnCoreArgs& a, int task, int lane)
+{
+    const int row = task % a.n_ba;          // output feature
+    const int r = task / a.n_ba;            // input row
+    const int k = a.k;
+    const half2* x2 = (const half2*) (a.x + (size_t) r * k);
+    const half2* w2 = (const half2*) (a.ba_w_t + (size_t) row * k);
+
+    float sum = 0.0f;
+    if (k % 256 == 0)
+    {
+        typedef _Float16 hv2 __attribute__((ext_vector_type(2)));
+        const uint4* xv = (const uint4*) x2;
+        const uint4* wv = (const uint4*) w2;
+        float s4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        #pragma unroll 4
+        for (int j = lane; j < k / 8; j += 32)
+        {
+            const uint4 p = xv[j], q = wv[j];
+            s4[0] = __builtin_amdgcn_fdot2(__builtin_bit_cast(hv2, p.x), __builtin_bit_cast(hv2, q.x), s4[0], false);
+            s4[1] = __builtin_amdgcn_fdot2(__builtin_bit_cast(hv2, p.y), __builtin_bit_cast(hv2, q.y), s4[1], false);
+            s4[2] = __builtin_amdgcn_fdot2(__builtin_bit_cast(hv2, p.z), __builtin_bit_cast(hv2, q.z), s4[2], false);
+            s4[3] = __builtin_amdgcn_fdot2(__builtin_bit_cast(hv2, p.w), __builtin_bit_cast(hv2, q.w), s4[3], false);
+        }
+        sum = (s4[0] + s4[1]) + (s4[2] + s4[3]);
+    }
+    else
+    {
+        for (int j = lane; j < k / 2; j += 32)
+        {
+            float2 xf = __half22float2(x2[j]);
+            float2 wf = __half22float2(w2[j]);
+            sum = fmaf(xf.x, wf.x, sum);
+            sum = fmaf(xf.y, wf.y, sum);
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(EXL3_FULL_MASK, sum, offset);
+
+    if (lane == 0)
+    {
+        if (a.ba_bias) sum += __half2float(a.ba_bias[row]);
+        a.ba[(size_t) r * a.n_ba + row] = sum;
+    }
+}
+
+template <bool HISTORY>
+__device__ __forceinline__ void gdn_mk_conv_task(const GdnCoreArgs& a, int d, int b)
+{
+    const int dim = a.F;
+    const int seqlen = a.S;
+    const int K = a.K;
+    const int state_size = a.state_size;
+    int slot = a.slots ? a.slots[b] : b;
+
+    // Input step s of channel d: bf16(qkv[b, s, d]), as gated_delta_net_fused_op_3 stores it
+    auto x_at = [&] (int s) -> float
+    {
+        return __bfloat162float(trunc_bf16(a.qkv[((size_t) b * seqlen + s) * dim + d]));
+    };
+    bfloat16* state_d = a.conv_state + ((size_t) slot * dim + d) * state_size;
+
+    float w[CONV1D_MAX_K];
+    #pragma unroll
+    for (int k = 0; k < CONV1D_MAX_K; ++k)
+        if (k < K) w[k] = __bfloat162float(a.conv_w[(size_t) d * K + k]);
+
+    float bias_d = a.conv_b ? __bfloat162float(a.conv_b[d]) : 0.0f;
+
+    float old_state[CONV1D_MAX_K];
+    float win[CONV1D_MAX_K];
+    #pragma unroll
+    for (int k = 0; k < CONV1D_MAX_K; ++k)
+        if (k < K) old_state[k] = __bfloat162float(state_d[k]);
+    #pragma unroll
+    for (int k = 0; k < CONV1D_MAX_K - 1; ++k)
+        if (k < K - 1) win[k] = old_state[k + 1];
+
+    for (int s = 0; s < seqlen; ++s)
+    {
+        win[K - 1] = x_at(s);
+
+        float acc = bias_d;
+        #pragma unroll
+        for (int k = 0; k < CONV1D_MAX_K; ++k)
+            if (k < K) acc = fmaf(w[k], win[k], acc);
+
+        acc *= _sigmoid_fast_exp(acc);
+
+        a.conv_out[((size_t) b * seqlen + s) * dim + d] = __float2bfloat16_rn(acc);
+
+        #pragma unroll
+        for (int k = 0; k < CONV1D_MAX_K - 1; ++k)
+            if (k < K - 1) win[k] = win[k + 1];
+    }
+
+    if constexpr (!HISTORY)
+    {
+        #pragma unroll
+        for (int k = 0; k < CONV1D_MAX_K; ++k)
+        {
+            if (k < K)
+            {
+                int src_t = seqlen + k;
+                float v = (src_t < K) ? old_state[src_t] : x_at(src_t - K);
+                state_d[k] = __float2bfloat16_rn(v);
+            }
+        }
+    }
+    else
+    {
+        int total = K + seqlen;
+        int write_size = state_size < total ? state_size : total;
+        int dst_start = state_size - write_size;
+        int src_start = total - write_size;
+        for (int j = 0; j < write_size; ++j)
+        {
+            int src_t = src_start + j;
+            float v = (src_t < K) ? old_state[src_t] : x_at(src_t - K);
+            state_d[dst_start + j] = __float2bfloat16_rn(v);
+        }
+    }
+}
+
+template <bool save_history>
+__global__ __launch_bounds__(128)
+void gdn_core_mk_kernel(const GdnCoreArgs a)
+{
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    // Stage 1: b/a GEMV (one warp per (row, output)) and conv update (one thread per (batch, channel))
+    {
+        const int num_warps = gridDim.x * 4;
+        for (int task = blockIdx.x * 4 + warp; task < a.R * a.n_ba; task += num_warps)
+            gdn_mk_ba_task(a, task, lane);
+        const int num_threads = gridDim.x * 128;
+        for (int c = blockIdx.x * 128 + tid; c < a.B * a.F; c += num_threads)
+            gdn_mk_conv_task<save_history>(a, c % a.F, c / a.F);
+    }
+
+    gdn_mk_grid_barrier(a.bar, a.epoch);
+
+    // Stage 2: recurrence, one block per (batch, v head, 32-column chunk) as in
+    // cuda_recurrent_gated_delta_rule_kernel_128_reg
+    constexpr int HEAD_DIM = 128;
+    constexpr int NSUB = 4;
+    constexpr int BTS = HEAD_DIM / NSUB;
+    constexpr size_t HEAD_STATE_SIZE = HEAD_DIM * HEAD_DIM;
+
+    const int num_k_heads = a.num_k_heads;
+    const int num_v_heads = a.num_v_heads;
+    const int seqlen = a.S;
+    const int group = num_v_heads / num_k_heads;
+    const size_t state_size = group * num_k_heads * HEAD_STATE_SIZE;
+    const size_t slot_size = (size_t) a.history_stride * state_size;
+
+    const int bi = blockIdx.x / (num_v_heads * 4);
+    const int head = (blockIdx.x / 4) % num_v_heads;
+    const int v_start = (blockIdx.x % 4) * 32;
+    const int k_head = head / group;
+
+    const bfloat16* mixed_qkv = a.conv_out + (size_t) bi * seqlen * (3 * HEAD_DIM * num_k_heads + HEAD_DIM * (num_v_heads - num_k_heads));
+    const float* ba = a.ba + (size_t) bi * seqlen * 2 * num_v_heads;
+    const int state_slot = a.slots ? a.slots[bi] : bi;
+    float* slot_state = a.recurrent_state + (size_t) state_slot * slot_size;
+    bfloat16* core_attn_out = a.core_attn_out + (size_t) bi * seqlen * num_v_heads * HEAD_DIM;
+
+    const int t = tid & 31;
+    const int bt = tid >> 5;
+
+    // beta / g of this head (gated_delta_net_fused_op_3): constant per head across tokens except for b/a
+    const float dt_bias_h = as_float(a.dt_bias[head]);
+    const float a_exp_h = __expf(a.a_log_f ? a.a_log_f[head] : as_float(a.a_log_bf[head]));
+
+    __shared__ float sh_red[2][HEAD_DIM / 32];
+    __shared__ float sh_k[HEAD_DIM];
+    __shared__ float sh_q[HEAD_DIM];
+    __shared__ float sh_dot1[NSUB][32];
+    __shared__ float sh_dot2[NSUB][32];
+
+    const size_t col_off = (size_t) head * HEAD_STATE_SIZE + v_start + t + (size_t) bt * BTS * HEAD_DIM;
+    float st[BTS];
+    #pragma unroll
+    for (int i = 0; i < BTS; ++i) st[i] = slot_state[col_off + (size_t) i * HEAD_DIM];
+
+    for (int s = 0; s < seqlen; ++s)
+    {
+        const bfloat16* gl_q = mixed_qkv + k_head * HEAD_DIM;
+        const bfloat16* gl_k = mixed_qkv + (num_k_heads + k_head) * HEAD_DIM;
+        const bfloat16* gl_v = mixed_qkv + (2 * num_k_heads * HEAD_DIM) + head * HEAD_DIM + v_start;
+        bfloat16* out = core_attn_out + head * HEAD_DIM + v_start;
+
+        float q = __bfloat162float(gl_q[tid]);
+        float k = __bfloat162float(gl_k[tid]);
+        float sumq = q * q;
+        float sumk = k * k;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+        {
+            sumq += __shfl_xor_sync(EXL3_FULL_MASK, sumq, offset);
+            sumk += __shfl_xor_sync(EXL3_FULL_MASK, sumk, offset);
+        }
+        if (lane == 0)
+        {
+            sh_red[0][warp] = sumq;
+            sh_red[1][warp] = sumk;
+        }
+        __syncthreads();
+        sumq = lane < HEAD_DIM / 32 ? sh_red[0][lane] : 0.0f;
+        sumk = lane < HEAD_DIM / 32 ? sh_red[1][lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+        {
+            sumq += __shfl_xor_sync(EXL3_FULL_MASK, sumq, offset);
+            sumk += __shfl_xor_sync(EXL3_FULL_MASK, sumk, offset);
+        }
+        sh_k[tid] = k * rsqrtf(sumk + 1e-6f);
+        sh_q[tid] = q * rsqrtf(sumq + 1e-6f);
+        __syncthreads();
+
+        const float* sk = sh_k + bt * BTS;
+        const float* sq = sh_q + bt * BTS;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i) sum = sum + sk[i] * st[i];
+        sh_dot1[bt][t] = sum;
+        __syncthreads();
+
+        const float bv = ba[(size_t) s * 2 * num_v_heads + head];
+        const float av = ba[(size_t) s * 2 * num_v_heads + num_v_heads + head];
+        const float gv = -softplus(av + dt_bias_h) * a_exp_h;
+        const float g_h = __expf(gv);
+        const float beta_h = __bfloat162float(trunc_bf16(_sigmoid_fast_exp(bv) * a.beta_scale));
+        float dot1 = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < NSUB; ++j) dot1 += sh_dot1[j][t];
+        const float v = __bfloat162float(gl_v[t]) - dot1 * g_h;
+        float v_out = 0.0f;
+        const bool last = s == seqlen - 1;
+        float* hw = slot_state + (save_history && !last ? (size_t) (s + 1) * state_size : 0) + col_off;
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i)
+        {
+            float state = st[i];
+            state = state * g_h + sk[i] * v * beta_h;
+            st[i] = state;
+            if (save_history || last) hw[(size_t) i * HEAD_DIM] = state;
+            v_out = v_out + sq[i] * state;
+        }
+        sh_dot2[bt][t] = v_out;
+        __syncthreads();
+
+        if (bt == 0)
+        {
+            float vo = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < NSUB; ++j) vo += sh_dot2[j][t];
+            out[t] = __float2bfloat16_rz(vo * a.scale);
+        }
+
+        mixed_qkv +=     2 * HEAD_DIM * num_k_heads + HEAD_DIM * num_v_heads;
+        core_attn_out += num_v_heads * HEAD_DIM;
+    }
+
+    // Epilogue: the last of the head's four column-chunk blocks normalizes and transforms the head
+    if (a.o_xh)
+    {
+        __shared__ int is_last;
+        __threadfence();
+        __syncthreads();
+        if (tid == 0)
+        {
+            unsigned* cnt = a.head_cnt + bi * num_v_heads + head;
+            unsigned prev = __hip_atomic_fetch_add(cnt, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+            is_last = prev == 3;
+            if (is_last) __hip_atomic_store(cnt, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
+        __syncthreads();
+        if (is_last)
+        {
+            __threadfence();
+            for (int s = warp; s < seqlen; s += 4)
+                gdn_mk_gnorm_had_task(a, bi * seqlen + s, head, lane);
+        }
+    }
+}
+
+#endif  // __HIP_PLATFORM_AMD__
+
+static int g_gdn_mk = -1;   // -1: from EXL3_GDN_MK (default on)
+
+void gdn_mk_set(int enable)
+{
+    g_gdn_mk = enable;
+}
+
+static bool gdn_mk_enabled()
+{
+    if (g_gdn_mk >= 0) return g_gdn_mk != 0;
+    static const bool e = !(std::getenv("EXL3_GDN_MK") && std::getenv("EXL3_GDN_MK")[0] == '0');
+    return e;
+}
+
+bool gdn_core_mk
+(
+    const at::Tensor& x,                        // [B, S, k] half
+    const at::Tensor& ba_w_t,                   // [2H, k] half
+    const c10::optional<at::Tensor>& ba_bias,   // [2H] half
+    at::Tensor& ba,                             // [B, S, 2H] float (scratch)
+    const at::Tensor& qkv,                      // [B, S, F] float
+    at::Tensor& conv_state,                     // [slots, F, state_size] bf16
+    const at::Tensor& slots,                    // [B] int
+    const at::Tensor& conv_w,                   // [F, K] bf16
+    const c10::optional<at::Tensor>& conv_b,    // [F] bf16
+    at::Tensor& conv_out,                       // [B, S, F] bf16 (scratch)
+    const at::Tensor& dt_bias,                  // [H] bf16
+    const at::Tensor& a_log,                    // [H] float or bf16
+    float beta_scale,
+    at::Tensor& recurrent_state,                // [slots, hist + 1, H, 128, 128] float
+    at::Tensor& core_attn_out,                  // [B, S, H, 128] bf16
+    int num_k_heads,
+    int num_v_heads,
+    int k_head_dim,
+    int v_head_dim,
+    bool history,
+    const c10::optional<at::Tensor>& o_suh,     // o_proj suh: also write its input transform (gated RMSNorm)
+    const c10::optional<at::Tensor>& gn_w,      // [128] bf16 or float
+    const c10::optional<at::Tensor>& gn_g,      // gate z, [B, S, H, 128] bf16 or float
+    float gn_eps,
+    float gn_bias,
+    bool gn_sigmoid
+)
+{
+    #ifdef __HIP_PLATFORM_AMD__
+        if (!gdn_mk_enabled() || !gdn_reg_enabled()) return false;
+        const int B = (int) qkv.size(0);
+        const int S = (int) qkv.size(1);
+        const int F = (int) qkv.size(2);
+        const int K = (int) conv_w.size(1);
+        // Same conditions as the register-resident recurrence path (v split 4 needs bsz 1)
+        if (B != 1 || k_head_dim != 128 || v_head_dim != 128 || num_v_heads > 64 || num_v_heads % num_k_heads) return false;
+        if (K > CONV1D_MAX_K || conv_state.size(2) < K) return false;
+        if (qkv.dtype() != at::kFloat || !qkv.is_contiguous() || !x.is_contiguous()) return false;
+        if (F != 2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim) return false;
+        if (history && recurrent_state.size(1) < S) return false;
+        TORCH_CHECK(ba.numel() == (int64_t) B * S * 2 * num_v_heads, "gdn_core_mk: bad ba scratch");
+        TORCH_CHECK(conv_out.numel() == (int64_t) B * S * F, "gdn_core_mk: bad conv_out");
+
+        const at::cuda::OptionalCUDAGuard device_guard(x.device());
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+        GdnCoreArgs a;
+        a.x = (const half*) x.data_ptr();
+        a.ba_w_t = (const half*) ba_w_t.data_ptr();
+        a.ba_bias = (const half*) OPTPTR(ba_bias);
+        a.ba = (float*) ba.data_ptr();
+        a.k = (int) x.size(-1);
+        a.n_ba = 2 * num_v_heads;
+        a.R = B * S;
+        a.qkv = (const float*) qkv.data_ptr();
+        a.conv_state = (bfloat16*) conv_state.data_ptr();
+        a.slots = (const int*) slots.data_ptr();
+        a.conv_w = (const bfloat16*) conv_w.data_ptr();
+        a.conv_b = (const bfloat16*) OPTPTR(conv_b);
+        a.conv_out = (bfloat16*) conv_out.data_ptr();
+        a.B = B;
+        a.F = F;
+        a.S = S;
+        a.state_size = (int) conv_state.size(2);
+        a.K = K;
+        a.dt_bias = (const bfloat16*) dt_bias.data_ptr();
+        a.a_log_f = a_log.dtype() == at::kFloat ? (const float*) a_log.data_ptr() : nullptr;
+        a.a_log_bf = a_log.dtype() == at::kBFloat16 ? (const bfloat16*) a_log.data_ptr() : nullptr;
+        if (!a.a_log_f && !a.a_log_bf) return false;
+        a.beta_scale = beta_scale;
+        a.recurrent_state = (float*) recurrent_state.data_ptr();
+        a.core_attn_out = (bfloat16*) core_attn_out.data_ptr();
+        a.num_k_heads = num_k_heads;
+        a.num_v_heads = num_v_heads;
+        a.scale = 1.0f / sqrtf((float) k_head_dim);
+        a.history_stride = (int) recurrent_state.size(1);
+
+        // Barrier words and per-head counters per device, zeroed once; the epoch only has to differ from
+        // the previous launch's
+        static unsigned* bar[MAX_DEVICES] = {};
+        static unsigned epoch[MAX_DEVICES] = {};
+        const int dev = x.device().index();
+        constexpr int BAR_WORDS = 2 + 64;
+        if (!bar[dev])
+        {
+            cuda_check(cudaMalloc(&bar[dev], BAR_WORDS * sizeof(unsigned)));
+            cuda_check(cudaMemsetAsync(bar[dev], 0, BAR_WORDS * sizeof(unsigned), stream));
+        }
+        if (++epoch[dev] == 0) epoch[dev] = 1;
+        a.bar = bar[dev];
+        a.epoch = epoch[dev];
+
+        // o_proj input transform epilogue: claims the RDNA3 input workspace for (core_attn_out, o_suh) so
+        // the following exl3_gemm_gnorm_gr launch skips its input kernel
+        a.head_cnt = bar[dev] + 2;
+        a.o_xh = nullptr;
+        a.o_xcs = nullptr;
+        if (o_suh.has_value() && gn_w.has_value() && gn_g.has_value() && gn_w->numel() == 128 &&
+            (gn_w->dtype() == at::kBFloat16 || gn_w->dtype() == at::kFloat) &&
+            (gn_g->dtype() == at::kBFloat16 || gn_g->dtype() == at::kFloat) &&
+            gn_g->is_contiguous() && gn_w->is_contiguous() && gn_g->numel() == core_attn_out.numel() &&
+            core_attn_out.is_contiguous() && B * num_v_heads <= 64)
+        {
+            uint2* xh;
+            float* xcs;
+            if (exl3_rdna3_prepare_input(dev, core_attn_out.data_ptr(), o_suh->data_ptr(), B * S, num_v_heads * 128, 1, &xh, &xcs))
+            {
+                a.o_xh = xh;
+                a.o_xcs = xcs;
+                a.o_suh = (const half*) o_suh->data_ptr();
+                a.gn = Exl3Rdna3GNorm { gn_w->data_ptr(), gn_g->data_ptr(), gn_eps, gn_bias,
+                    GN_ACTIVE | (gn_w->dtype() == at::kBFloat16 ? GN_W_BF16 : 0) | (gn_g->dtype() == at::kBFloat16 ? GN_G_BF16 : 0) |
+                    (gn_sigmoid ? GN_SIGMOID : 0) };
+                a.gn_g = gn_g->data_ptr();
+            }
+        }
+
+        dim3 grid(B * num_v_heads * 4);
+        dim3 block(128);
+        if (history) gdn_core_mk_kernel<true><<<grid, block, 0, stream>>>(a);
+        else         gdn_core_mk_kernel<false><<<grid, block, 0, stream>>>(a);
+        cuda_check(cudaPeekAtLastError());
+        return true;
+    #else
+        return false;
+    #endif
+}

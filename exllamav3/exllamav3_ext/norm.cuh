@@ -38,7 +38,10 @@ bool rms_norm_had
     float constant_bias,
     float constant_scale,
     at::Tensor suh_tab,
-    int num_src
+    int num_src,
+    c10::optional<at::Tensor> abl_a,
+    c10::optional<at::Tensor> abl_b,
+    c10::optional<at::Tensor> abl_s
 );
 
 void rms_norm_res_in
@@ -49,7 +52,10 @@ void rms_norm_res_in
     at::Tensor r,
     float epsilon,
     float constant_bias,
-    float constant_scale
+    float constant_scale,
+    c10::optional<at::Tensor> abl_a,
+    c10::optional<at::Tensor> abl_b,
+    c10::optional<at::Tensor> abl_s
 );
 
 void gated_rms_norm

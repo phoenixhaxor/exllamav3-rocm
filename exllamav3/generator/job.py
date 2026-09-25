@@ -596,6 +596,40 @@ class Job:
         return next_token, next_k_tokens, next_k_probs, next_prob
 
 
+    def can_presample_window(self) -> bool:
+        """
+        True if all positions of a speculative verification window can be sampled in one batched call before
+        any of them is accepted: nothing in the sampling state depends on tokens accepted inside the window (no
+        filters or logit mask, no past-ID penalties, no forced tokens or token healing, no min_new_tokens stop
+        block or banned-string checkpoint, no probabilities to return). The sampling distribution per position is
+        unchanged; only the random draws are taken in one call.
+        """
+        return (
+            not self.filters and
+            self.device_logit_mask is None and
+            not self.sampler.reqs_past_ids and
+            self.forced_ids is None and
+            self.new_tokens >= self.min_new_tokens and
+            self.new_tokens >= 0 and
+            self.checkpoint is None and
+            not self.return_probs and
+            self.return_top_tokens == 0
+        )
+
+
+    def presample_window(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Launch sampling of every position of a verification window, logits (1, n, vocab); returns the (1, n)
+        samples on the logits device. Only valid when can_presample_window()
+        """
+        return self.sampler.forward(
+            logits,
+            None,
+            self.rng.randint(0, (1<<32)-1),
+            self.generator.tokenizer,
+        )
+
+
     def receive_sample(
         self,
         logits: torch.Tensor | None,
@@ -1047,7 +1081,7 @@ class Job:
             "time_enqueued": self.time_enqueued,
             "time_prefill": self.time_prefill,
             "time_generate": self.time_generate,
-            "rq_new_tokens": self.new_tokens,   # every token accepted so far counts; the requeued segment starts after them
+            "rq_new_tokens": self.rq_new_tokens + self.new_tokens,   # every token accepted so far counts (all previous rounds); the requeued segment starts after them
             "accepted_draft_tokens": self.accepted_draft_tokens,
             "rejected_draft_tokens": self.rejected_draft_tokens,
             "prompt_tokens": self.rq_prompt_tokens or len(seq.input_ids),

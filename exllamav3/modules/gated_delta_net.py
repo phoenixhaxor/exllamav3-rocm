@@ -18,6 +18,7 @@ import os
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
 # EXL3_BC_GDN=0 disables the graph-captured decode paths (torch path only), for A/B testing
 _bc_gdn_enable = os.environ.get("EXL3_BC_GDN", "1") != "0"
+_rewind_cache_enable = os.environ.get("EXL3_REWIND_CACHE", "1") != "0"
 from ..model.model_tp_shared import TPTensorWrapper
 from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 from ..cache.recurrent import (
@@ -54,6 +55,30 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
         else:
             l.rewind(slot, last_history, num_tokens)
     return jobs_by_device
+
+
+def _cached_rewind_jobs(cache, layers: dict, slot: int, last_history: int, num_tokens: int):
+    """_collect_rewind_jobs, memoized per cache on (slot, last_history, num_tokens). The job addresses depend
+    only on those and on the state tensors, which are allocated once with the cache (the key includes their
+    base pointers). Only for caches whose recurrent layers are all GDNLayerState, since other state types
+    rewind by side effect inside _collect_rewind_jobs."""
+    store = cache.__dict__.setdefault("_gdn_rewind_jobs", {})
+    sig = store.get("sig")
+    if sig is None:
+        vals = list(layers.values())
+        if not vals or not all(isinstance(l, GDNLayerState) and l.device is not None for l in vals):
+            return _collect_rewind_jobs(vals, slot, last_history, num_tokens)
+        sig = store["sig"] = (len(vals), vals[0].conv_state.data_ptr(), vals[-1].recurrent_state.data_ptr())
+        store["vals"] = vals
+    vals = store["vals"]
+    if (len(layers), vals[0].conv_state.data_ptr(), vals[-1].recurrent_state.data_ptr()) != sig:
+        store.clear()
+        return _cached_rewind_jobs(cache, layers, slot, last_history, num_tokens)
+    key = (slot, last_history, num_tokens)
+    jobs = store.get(key)
+    if jobs is None:
+        jobs = store[key] = _collect_rewind_jobs(vals, slot, last_history, num_tokens)
+    return jobs
 
 
 def _dispatch_rewind_jobs(jobs_by_device):
@@ -114,9 +139,12 @@ class GDNState:
 
     def rewind(self, num_tokens: int):
         if not self.cache.model.loaded_tp:
-            _dispatch_rewind_jobs(_collect_rewind_jobs(
-                self.cache.get_all_recurrent_layers().values(), self.slot, self.last_history, num_tokens
-            ))
+            layers = self.cache.get_all_recurrent_layers()
+            if _rewind_cache_enable:
+                jobs = _cached_rewind_jobs(self.cache, layers, self.slot, self.last_history, num_tokens)
+            else:
+                jobs = _collect_rewind_jobs(layers.values(), self.slot, self.last_history, num_tokens)
+            _dispatch_rewind_jobs(jobs)
         else:
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_rewind, (id(self.cache), self.slot, self.last_history, num_tokens))
         self.position -= num_tokens

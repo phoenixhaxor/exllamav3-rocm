@@ -214,6 +214,12 @@ void BC_GatedDeltaNetSplit::set_qkvz_bundle
     qkvz_mul1 = mul1;
 }
 
+static bool gdn_fuse_gnorm()
+{
+    static const bool e = !(std::getenv("EXL3_FUSE_GNORM") && std::getenv("EXL3_FUSE_GNORM")[0] == '0');
+    return e;
+}
+
 void BC_GatedDeltaNetSplit::run_bszN_gr
 (
     const at::Tensor& x,
@@ -249,6 +255,9 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
             add_gr(s.qkv, qkv_proj->bias.value(), s.qkv, graph);
     }
 
+    // Eager decode: the b/a GEMV, conv update and recurrence as one cooperative launch (gdn_core_mk)
+    bool core_done = false;
+
     if (kda)
     {
         // KDA: three fp16 GEMVs off x (patched inputs), low-rank second stages and the gate op
@@ -276,50 +285,68 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
                 add_gr(s.z_flat, z_proj->bias.value(), s.z_flat, graph);
         }
 
-        gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, graph);
-
-        gated_delta_net_fused_op_3_gr
+        // With the gated norm folded into o_proj's input transform, the megakernel also writes that transform
+        const bool gnorm_path = gdn_fuse_gnorm() && norm->w_groups == 1 && !norm->gate_first;
+        core_done = !graph && gdn_core_mk
         (
-            s.qkv, s.ba,
-            dt_bias, a_log,
-            s.mixed_qkv, s.beta, s.g,
-            beta_scale,
+            x, ba_weight_t, ba_bias, s.ba, s.qkv, conv_state, slots, conv1d_weight, conv1d_bias, s.conv_out,
+            dt_bias, a_log, beta_scale, recurrent_state, s.core_attn_out,
+            num_k_heads, num_v_heads, k_head_dim, v_head_dim, history,
+            gnorm_path ? c10::optional<at::Tensor>(o_proj->suh) : c10::nullopt,
+            gnorm_path ? c10::optional<at::Tensor>(norm->weight) : c10::nullopt,
+            gnorm_path ? c10::optional<at::Tensor>(s.z) : c10::nullopt,
+            norm->rms_norm_eps, norm->constant_bias, norm->gate_act == 1
+        );
+
+        if (!core_done)
+        {
+            gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, graph);
+
+            gated_delta_net_fused_op_3_gr
+            (
+                s.qkv, s.ba,
+                dt_bias, a_log,
+                s.mixed_qkv, s.beta, s.g,
+                beta_scale,
+                graph
+            );
+        }
+    }
+
+    if (!core_done)
+    {
+        cuda_causal_conv1d_update_gr
+        (
+            s.mixed_qkv,
+            conv_state,
+            slots,
+            conv1d_weight,
+            conv1d_bias,
+            s.conv_out,
+            true,
+            history,
+            graph
+        );
+
+        cuda_recurrent_gated_delta_rule_gr
+        (
+            s.conv_out,
+            s.g,
+            s.beta,
+            recurrent_state,
+            s.core_attn_out,
+            num_k_heads,
+            num_v_heads,
+            k_head_dim,
+            v_head_dim,
+            slots,
+            history,
             graph
         );
     }
 
-    cuda_causal_conv1d_update_gr
-    (
-        s.mixed_qkv,
-        conv_state,
-        slots,
-        conv1d_weight,
-        conv1d_bias,
-        s.conv_out,
-        true,
-        history,
-        graph
-    );
-
-    cuda_recurrent_gated_delta_rule_gr
-    (
-        s.conv_out,
-        s.g,
-        s.beta,
-        recurrent_state,
-        s.core_attn_out,
-        num_k_heads,
-        num_v_heads,
-        k_head_dim,
-        v_head_dim,
-        slots,
-        history,
-        graph
-    );
-
     // RDNA3: gated RMSNorm folded into o_proj's input transform (EXL3_FUSE_GNORM=0 disables)
-    static const bool fuse_gnorm = !(std::getenv("EXL3_FUSE_GNORM") && std::getenv("EXL3_FUSE_GNORM")[0] == '0');
-    bool fused_norm = fuse_gnorm && norm->w_groups == 1 && !norm->gate_first &&
+    bool fused_norm = gdn_fuse_gnorm() && norm->w_groups == 1 && !norm->gate_first &&
         exl3_gemm_gnorm_gr(s.core_attn_out, s.z, norm->weight, norm->rms_norm_eps, norm->constant_bias, norm->gate_act == 1,
                            o_proj->trellis, y, o_proj->suh, o_proj->svh, o_proj->mcg, o_proj->mul1, graph);
     if (!fused_norm)

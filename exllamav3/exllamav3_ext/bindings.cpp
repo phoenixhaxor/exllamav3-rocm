@@ -14,6 +14,7 @@
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
+#include "ablate.cuh"
 #include "routing.cuh"
 #include "gdn.cuh"
 #include "add.cuh"
@@ -99,6 +100,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("rms_norm_had", &rms_norm_had, "rms_norm_had");
     m.def("softcap", &softcap, "softcap");
+    m.def("ablate", &ablate, "ablate");
+    m.def("gdn_mk_set", &gdn_mk_set, "gdn_mk_set");
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
     m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");

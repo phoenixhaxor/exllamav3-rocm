@@ -15,6 +15,8 @@ from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
 import os
 _presample_enable = os.environ.get("EXL3_PRESAMPLE", "1") != "0"
+_adapt_window_enable = os.environ.get("EXL3_ADAPT_WINDOW", "0") == "1"   # off: +4% prose, -3% code
+from .adaptive_window import AdaptiveWindow
 _draft_nb_enable = os.environ.get("EXL3_DRAFT_NB", "1") != "0"
 from .job import Job
 from .filter import Filter
@@ -264,6 +266,12 @@ class Generator:
         self._draft_conf_round = None
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
+
+        # Throughput-optimal verification window for block (DFlash) drafters, unless the confidence
+        # calibrator already manages the window
+        self.adaptive_window = None
+        if self.dflash_draft and self.draft_calibrator is None and self.num_draft_tokens > 3:
+            self.adaptive_window = AdaptiveWindow(self.num_draft_tokens)
 
 
     def num_remaining_jobs(self):
@@ -820,6 +828,8 @@ class Generator:
 
         # The diffusion drafter always runs at its fixed block size, dynamic window truncates the drafted block
         window = self.num_draft_tokens
+        if self.adaptive_window is not None and _adapt_window_enable:
+            window = self.adaptive_window.choose()
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
@@ -1280,6 +1290,8 @@ class Generator:
                 # Record per-round draft stats. Skip abandoned windows (banned-string rewind);
                 # checkpoint-boundary truncations are rare enough to count as ordinary rejections.
                 if draft_tokens is not None and rejected != -1:
+                    if self.adaptive_window is not None:
+                        self.adaptive_window.update(draft_tokens.shape[-1], accepted_length - 1)
                     if self.record_draft_stats:
                         job.draft_stats.append((
                             job.new_tokens,

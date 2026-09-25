@@ -325,7 +325,16 @@ __device__ __forceinline__ void exl3_rdna3_unit
     }
 
     constexpr int TWORDS = half_k ? 4 * (2 * bits + 1) : 8 * bits;   // uint32 per 16x16 tile
-    constexpr int LPT = (TWORDS + 31) / 32;                            // words per lane per tile
+#ifdef EXL3_RDNA3_NO_DIRECT
+    constexpr bool DIRECT = false;
+#else
+    // Raw integer path: each lane loads exactly the tile words its eight windows need (2, or 4 for 5 / 6
+    // bits) instead of one slice of the tile plus cross-lane gathers (ds_bpermute, and a select for tiles
+    // over 32 words). The wave still reads the same tile bytes (coalesced), the arithmetic is unchanged
+    // (4-bit single-row matmuls stay on the gather path, measured ~2% faster there)
+    constexpr bool DIRECT = cb == 2 && !half_k && bits >= 2 && bits <= 6 && (bits != 4 || MR >= 4);
+#endif
+    constexpr int LPT = DIRECT ? (bits >= 5 ? 4 : 2) : (TWORDS + 31) / 32;   // words per lane per tile
     constexpr int KCS = XS_BYTES / (MR * 2) / 16 / 8 * 8;              // k-slices per staged x chunk
     static_assert(KCS % 8 == 0, "x chunk must cover whole 128-element Hadamard blocks");
     // Register-resident tile words and raw mul1 decode (codebook affine map folded into the epilogue)
@@ -401,6 +410,14 @@ __device__ __forceinline__ void exl3_rdna3_unit
         int lofs[LPT];
         #pragma unroll
         for (int l = 0; l < LPT; ++l) lofs[l] = min(l * 32 + lane, TWORDS - 1);
+        if constexpr (DIRECT)
+        {
+            // Word indices in windows8's gather order, from windows8 itself (so the two can't disagree)
+            int c = 0;
+            uint32_t unused[8];
+            auto record = [&] (int jw) -> uint32_t { lofs[c++] = jw; return 0u; };
+            windows8<bits>(record, lane, unused);
+        }
 
         // Per-lane byte offset within a k-slice row (vector) + k-slice offset (uniform, scalar), 32-bit
         uint32_t voff[TPW][LPT];
@@ -480,9 +497,11 @@ __device__ __forceinline__ void exl3_rdna3_unit
                     else if constexpr (RAW)
                     {
                         // Tile words resolved in-wave (ds_bpermute), no LDS round trip
+                        int wc = 0;
                         auto gather = [&] (int j) -> uint32_t
                         {
-                            if constexpr (LPT == 1) return __shfl(w[0], j);
+                            if constexpr (DIRECT) return w[wc++];
+                            else if constexpr (LPT == 1) return __shfl(w[0], j);
                             else
                             {
                                 uint32_t lo = __shfl(w[0], j & 31);

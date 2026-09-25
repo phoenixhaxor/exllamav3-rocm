@@ -55,7 +55,7 @@ int main(int argc, char** argv)
         }
     }
     hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
-    int it = 1000;
+    int it = getenv("KB_IT") ? atoi(getenv("KB_IT")) : 1000;
     hipEventRecord(e0); for (int i = 0; i < it; ++i) launch(); hipEventRecord(e1); hipEventSynchronize(e1);
     float ms; hipEventElapsedTime(&ms, e0, e1);
     double us = ms * 1000 / it;

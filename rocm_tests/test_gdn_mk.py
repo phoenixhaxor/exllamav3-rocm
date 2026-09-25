@@ -18,6 +18,7 @@ prompts = [
 ]
 def run(mk, draft):
     ext.gdn_mk_set(mk)
+    if hasattr(ext, "act_epi_set"): ext.act_epi_set(mk)
     gen = Generator(model = model, cache = cache, tokenizer = tok, draft_model = dm if draft else None, draft_cache = dc if draft else None)
     return [gen.generate(prompt = p, max_new_tokens = 250, sampler = ComboSampler(temperature = 0.0),
                          encode_special_tokens = True, completion_only = True) for p in prompts]

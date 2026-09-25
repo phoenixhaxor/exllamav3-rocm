@@ -16,8 +16,16 @@ namespace
     int* g_counters[MAX_DEVICES] = {};
     uint2* g_xh[MAX_DEVICES] = {};
     float* g_xcs[MAX_DEVICES] = {};
-    struct Prepared { const void* A; const void* suh_tab; int m, k, num_src; };
+    // A producer wrote the transformed input of the next matmul on (A, suh_tab) into xh / xcs
+    struct Prepared { const void* A; const void* suh_tab; int m, k, num_src; uint2* xh; float* xcs; };
     Prepared g_prepared[MAX_DEVICES] = {};
+    // Second input workspace, written by the gate/up epilogue while the mgemm still reads g_xh
+    uint2* g_xh2[MAX_DEVICES] = {};
+    float* g_xcs2[MAX_DEVICES] = {};
+    int* g_act_cnt[MAX_DEVICES] = {};
+    const void* g_act_suh[MAX_DEVICES] = {};
+    constexpr size_t XH2_BYTES = 2ull << 20;
+    constexpr size_t XCS2_FLOATS = 1 << 15;
     int g_enabled = -1;
     int g_target_blocks = -1;
 }
@@ -49,6 +57,10 @@ void exl3_rdna3_prepare(int device)
         cuda_check(cudaMemset(g_counters[device], 0, EXL3_RDNA3_MAX_COUNTERS * sizeof(int)));
         cuda_check(cudaMalloc(&g_xh[device], EXL3_RDNA3_XH_BYTES));
         cuda_check(cudaMalloc(&g_xcs[device], EXL3_RDNA3_XCS_FLOATS * sizeof(float)));
+        cuda_check(cudaMalloc(&g_xh2[device], XH2_BYTES));
+        cuda_check(cudaMalloc(&g_xcs2[device], XCS2_FLOATS * sizeof(float)));
+        cuda_check(cudaMalloc(&g_act_cnt[device], EXL3_RDNA3_MAX_COUNTERS * sizeof(int)));
+        cuda_check(cudaMemset(g_act_cnt[device], 0, EXL3_RDNA3_MAX_COUNTERS * sizeof(int)));
         cuda_check(cudaDeviceSynchronize());
     #endif
 }
@@ -120,13 +132,31 @@ bool exl3_rdna3_prepare_input(int device, const void* A, const void* suh_tab, in
         if ((size_t) num_src * m * k * 2 > EXL3_RDNA3_XH_BYTES) return false;
         if ((size_t) num_src * m * (k / 128) > EXL3_RDNA3_XCS_FLOATS) return false;
         if (!g_ws[device]) exl3_rdna3_prepare(device);
-        g_prepared[device] = { A, suh_tab, m, k, num_src };
+        g_prepared[device] = { A, suh_tab, m, k, num_src, g_xh[device], g_xcs[device] };
         *xh = g_xh[device];
         *xcs = g_xcs[device];
         return true;
     #else
         return false;
     #endif
+}
+
+static int g_act_epi = -1;   // -1: from EXL3_ACT_EPI (default on)
+
+void exl3_rdna3_act_epi_set(int enable)
+{
+    g_act_epi = enable;
+}
+
+void exl3_rdna3_arm_act_epilogue(int device, const void* down_suh)
+{
+    if (g_act_epi < 0) g_act_epi = !(std::getenv("EXL3_ACT_EPI") && std::getenv("EXL3_ACT_EPI")[0] == '0');
+    g_act_suh[device] = g_act_epi ? down_suh : nullptr;
+}
+
+void exl3_rdna3_disarm_act_epilogue(int device)
+{
+    g_act_suh[device] = nullptr;
 }
 
 bool exl3_rdna3_gemm
@@ -195,7 +225,12 @@ bool exl3_rdna3_gemm
             const int had_tasks = m * kblocks;
             const bool prepared = !graph && r0 == 0 && m == size_m && pr.A == (const void*) A &&
                                   pr.suh_tab == (const void*) suh && pr.m == size_m && pr.k == size_k && pr.num_src == 1;
-            if (!prepared)
+            if (prepared)
+            {
+                xh = pr.xh;
+                xcs = pr.xcs;
+            }
+            else
                 exl3_rdna3_had_kernel<<<(had_tasks + 7) / 8, 256, 0, stream>>>(A_r, suh, xh, xcs, m, size_k, nullptr, A_up ? A_up + (size_t) r0 * size_k : nullptr,
                                                                                gn ? *gn : Exl3Rdna3GNorm {});
             kernel<<<dim3(groups * splits, row_chunks), EXL3_RDNA3_THREADS, 0, stream>>>
@@ -276,16 +311,40 @@ bool exl3_rdna3_mgemm
         const bool prepared = !graph && pr.A == (const void*) A && pr.suh_tab == (const void*) suh_tab &&
                               pr.m == size_m && pr.k == size_k && pr.num_src == num_src;
         g_prepared[device].A = nullptr;
+        if (prepared)
+        {
+            xh = pr.xh;
+            xcs = pr.xcs;
+        }
         const int had_tasks = size_m * kblocks;
         if (!prepared)
             exl3_rdna3_had_kernel<<<dim3((had_tasks + 7) / 8, num_src), 256, 0, stream>>>(A, nullptr, xh, xcs, size_m, size_k, suh_tab, nullptr, Exl3Rdna3GNorm {});
 
         Exl3Rdna3MTab mt { b_tab, svh_tab, c_tab, n_stride_tab, src_tab };
+
+        // Gated MLP epilogue (armed by the caller): gate / up outputs contiguous in C, fp16
+        const void* act_suh = g_act_suh[device];
+        g_act_suh[device] = nullptr;
+        const bool act = act_suh && !graph && num_entries == 2 && !c_fp32 && !c_tab && !n_stride_tab &&
+                         (size_t) size_m * size_n * 2 <= XH2_BYTES && (size_t) size_m * groups <= XCS2_FLOATS &&
+                         row_chunks * groups <= EXL3_RDNA3_MAX_COUNTERS;
+        if (act)
+        {
+            mt.act_g = (const half*) C;
+            mt.act_u = ((const half*) C) + (size_t) size_m * size_n;
+            mt.act_suh = (const half*) act_suh;
+            mt.act_xh = g_xh2[device];
+            mt.act_xcs = g_xcs2[device];
+            mt.act_cnt = g_act_cnt[device];
+            mt.act_k = size_n;
+        }
         kernel<<<dim3(groups * splits, row_chunks, num_entries), EXL3_RDNA3_THREADS, 0, stream>>>
         (
             xh, nullptr, C, size_m, size_k, size_n, g_counters[device], xcs, g_ws[device], nullptr,
             splits, ks_per_split, mt
         );
+        if (act)
+            g_prepared[device] = { C, act_suh, size_m, size_n, 1, g_xh2[device], g_xcs2[device] };
 
         // Graph patching: the input (A) only; output tables and pointers are static
         if (graph)

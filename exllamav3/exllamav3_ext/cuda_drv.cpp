@@ -30,7 +30,13 @@ const CudaDrv& CudaDrv::instance()
             void* lib = (void*) LoadLibraryA("nvcuda.dll");
         #else
             #ifdef __HIP_PLATFORM_AMD__
-            void* lib = dlopen("libamdhip64.so", RTLD_NOW | RTLD_GLOBAL);
+            // Prefer the HIP runtime this process already runs on (torch / the extension link it by
+            // soname); a bare "libamdhip64.so" can resolve to a different ROCm install (e.g. /opt/rocm
+            // under a pip ROCm SDK), and launching through a second runtime crashes
+            void* lib = nullptr;
+            for (const char* name : { "libamdhip64.so.7", "libamdhip64.so.8", "libamdhip64.so.9", "libamdhip64.so.10", "libamdhip64.so.6" })
+                if ((lib = dlopen(name, RTLD_NOW | RTLD_NOLOAD))) break;
+            if (!lib) lib = dlopen("libamdhip64.so", RTLD_NOW | RTLD_GLOBAL);
 #else
             void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
 #endif

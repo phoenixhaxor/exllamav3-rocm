@@ -40,6 +40,15 @@ struct Exl3Rdna3MTab
     const uint64_t* c;         // output pointers, or null: C + e * size_m * size_n
     const int* n_stride;       // row stride of trellis and output, or null: size_n
     const int* src;            // input source (xh / xcs slab), or null: e
+    // Optional gated-MLP epilogue (two entries gate, up with fp16 outputs): the second block to finish a
+    // column group writes silu(gate) * up of that group, transformed as the down projection's input
+    const half* act_g;         // null: no epilogue
+    const half* act_u;
+    const half* act_suh;       // down projection suh
+    uint2* act_xh;
+    float* act_xcs;
+    int* act_cnt;              // per (row chunk, group), zero between launches
+    int act_k;                 // gate/up width = down input width
 };
 
 // Gated RMSNorm folded into the input transform (GatedDeltaNet output -> o_proj): each 128-element
@@ -148,6 +157,12 @@ bool exl3_rdna3_mgemm
 // records it as prepared for (A, suh_tab, m, k, num_src); the next exl3_rdna3_mgemm with exactly that
 // input skips its input kernel (eager launches only), any other RDNA3 matmul drops the record
 bool exl3_rdna3_prepare_input(int device, const void* A, const void* suh_tab, int m, int k, int num_src, uint2** xh, float** xcs);
+
+// Gated MLP: arm the silu(gate) * up input-transform epilogue for the next exl3_rdna3_mgemm (gate/up pair)
+// on this device; the matching down projection (exl3_rdna3_gemm on the gate output with A_up) then skips its
+// input kernel. Disarm after the mgemm call, whether or not it consumed the arming
+void exl3_rdna3_arm_act_epilogue(int device, const void* down_suh);
+void exl3_rdna3_disarm_act_epilogue(int device);
 
 void exl3_rdna3_prepare(int device);
 bool exl3_rdna3_enabled();

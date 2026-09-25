@@ -1,5 +1,8 @@
 #include <Python.h>
 #include "mlp.h"
+
+void exl3_rdna3_arm_act_epilogue(int device, const void* down_suh);
+void exl3_rdna3_disarm_act_epilogue(int device);
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
@@ -37,6 +40,10 @@ void BC_GatedMLP::run_bszN_gr
 
     if (gu_ptrs_trellis)
     {
+        // RDNA3: the gate/up matmul also writes the down projection's input transform of silu(g) * u
+        // (consumed by exl3_gemm_silu_gr below, which then skips its input kernel)
+        const bool act_epi = !graph && act_silu && act_limit == 0.0f && fuse_act_down;
+        if (act_epi) exl3_rdna3_arm_act_epilogue(x.device().index(), down->suh.data_ptr());
         exl3_mgemm_gr
         (
             x,
@@ -58,6 +65,7 @@ void BC_GatedMLP::run_bszN_gr
             1   // mgemm's reduction-group param, unused here (no weights -> no reduction runs);
                 // bszm=2 is the gate/up slot pair, unrelated to num_tokens (carried via size_m)
         );
+        if (act_epi) exl3_rdna3_disarm_act_epilogue(x.device().index());
     }
     else
     {

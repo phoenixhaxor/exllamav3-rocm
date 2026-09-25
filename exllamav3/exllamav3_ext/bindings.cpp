@@ -17,6 +17,7 @@
 #include "ablate.cuh"
 #include "routing.cuh"
 #include "gdn.cuh"
+void exl3_rdna3_act_epi_set(int enable);
 #include "add.cuh"
 #include "dflash2.cuh"
 
@@ -102,6 +103,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("softcap", &softcap, "softcap");
     m.def("ablate", &ablate, "ablate");
     m.def("gdn_mk_set", &gdn_mk_set, "gdn_mk_set");
+    m.def("act_epi_set", &exl3_rdna3_act_epi_set, "act_epi_set");
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
     m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");

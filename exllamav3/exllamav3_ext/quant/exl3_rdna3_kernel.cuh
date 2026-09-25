@@ -636,6 +636,44 @@ __device__ __forceinline__ void exl3_rdna3_unit
             cp[1] = __floats2half2_rn(h2, h3);
         }
     }
+
+    // Gated MLP epilogue: the second of the (gate, up) blocks finishing this column group writes the down
+    // projection's input transform of silu(gate) * up (exl3_rdna3_had_kernel's A_up path, same rounding)
+    if constexpr (!c_fp32)
+    {
+        if (mt.act_g)
+        {
+            __threadfence();
+            __syncthreads();
+            if (threadIdx.x == 0)
+            {
+                int* cnt = mt.act_cnt + rc * groups + group;
+                const int prev = __hip_atomic_fetch_add(cnt, 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+                last_flag = prev == 1;
+                if (prev == 1) __hip_atomic_store(cnt, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            }
+            __syncthreads();
+            if (last_flag)
+            {
+                __threadfence();
+                auto sigmoid2 = [] (half2 x) -> half2
+                {
+                    const half2 one = __float2half2_rn(1.0f);
+                    return h2rcp(__hadd2(one, h2exp(__hneg2(x))));
+                };
+                for (int m = warp; m < rows; m += WAVES)
+                {
+                    const size_t o = (size_t) (row0 + m) * mt.act_k + group * 128 + lane * 4;
+                    const half2* gp = (const half2*) (mt.act_g + o);
+                    const half2* up = (const half2*) (mt.act_u + o);
+                    half2 x01 = gp[0], x23 = gp[1];
+                    x01 = __hmul2(__hmul2(x01, sigmoid2(x01)), up[0]);
+                    x23 = __hmul2(__hmul2(x23, sigmoid2(x23)), up[1]);
+                    exl3_rdna3_had::transform_block(x01, x23, mt.act_suh, mt.act_xh, mt.act_xcs, row0 + m, group, mt.act_k, lane);
+                }
+            }
+        }
+    }
 }
 
 template <int bits, bool half_k, int cb, int MR, bool c_fp32>

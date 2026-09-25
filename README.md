@@ -287,16 +287,48 @@ each graph launch adds ~8 us of GPU idle. Replacing the per-module graphs with e
 | 3.0 bpw main model | not faster (decode cost is per weight) and lower quality |
 | Dynamic draft length, hot-token (vocabulary-pruned) draft head | slower end-to-end |
 
+### Megakernel and host-side round
+
+Measured in-process with `rocm_tests/bench_ab.py` (greedy, variants interleaved per prompt, median
+ms per speculative round): **38.0 -> 35.9 ms per round**. All kernel changes are bit-identical to the
+kernels they replace (`rocm_tests/test_gdn_mk.py`, `test_presample.py`).
+
+| Change | Effect | Switch |
+|---|---|---|
+| Runtime ablation sidecar: float4 kernel, ablation folded into the residual RMSNorm | ~-1.4 ms (heretic models only) | `EXL3_ABL_FUSE=0` |
+| Batched verification sampling (one launch and one sync for the whole window), stream-ordered draft readback, memoized recurrent rewind jobs | ~-0.3 ms | `EXL3_PRESAMPLE=0`, `EXL3_DRAFT_NB=0`, `EXL3_REWIND_CACHE=0` |
+| `gdn_core_mk`: b/a GEMV + conv update, grid barrier, recurrence in one launch (was four kernels per DeltaNet layer); the last of each head's four blocks also writes o_proj's gated-norm input transform | ~-0.45 ms | `EXL3_GDN_MK=0` |
+| Gated MLP: the gate/up matmul's second block per column group writes the down projection's input transform of silu(gate) * up | ~-0.15 ms | `EXL3_ACT_EPI=0` |
+
+Kernels per round went from ~1085 to ~718. Notes from this round:
+
+- torch.profiler under-reports long kernels on ROCm: the ~270 us "gap" after every lm_head matmul is
+  the lm_head itself (~1.55 ms, event-timed). Most of the apparent host turnaround was this artifact;
+  judge changes with wall-clock A/B, not the profiler's idle time.
+- A grid barrier inside a persistent kernel costs ~0.4-2.5 us against ~3-6 us for a kernel boundary,
+  but `hipLaunchCooperativeKernel` adds 10-20 us per launch; the megakernel uses a normal launch with
+  an atomic epoch barrier (its grid is far below one residency wave).
+- Epilogues that need no barrier use a per-tile counter: the last block to finish a unit does the
+  dependent work (no deadlock risk, no co-residency assumption).
+
+### ROCm 10
+
+ROCm 10.0 (TheRock packaging, `stable.repo.amd.com`, torch `2.13.0+rocm10.0.0` wheels) builds and runs
+this port with two fixes: the Triton-kernel launcher now takes the already-loaded HIP runtime
+(`dlopen` of the bare `libamdhip64.so` picked the system ROCm next to the pip SDK and crashed), and
+`OMP_NUM_THREADS` must be set (the wheel defaults to one OpenMP thread per logical CPU, which made
+the small CPU ops around each forward take ~17 ms). With those, a round takes the same time as on
+7.2.4 (35.9 vs 36.0 ms) and the per-kernel dispatch cost is unchanged (2.94 us).
+
 ### Open ideas (not done)
 
-Estimated gains are per speculative round (~39 ms); each is small, which is why they were left out.
+Estimated gains are per speculative round (~36 ms); each is small, which is why they were left out.
 
 | Idea | Estimated gain | Notes |
 |---|---|---|
-| Host turnaround after the verification sync | up to ~1 ms (~2.5%) | keep draft tokens on the GPU, build the next batch while the GPU is busy, avoid the pinned D2H copy before verification; requires restructuring the generator loop |
-| Per-layer "megakernel" (persistent kernel running a whole block) | up to ~3 ms (dispatch gaps) | large effort; needs grid-wide barriers between dependent stages |
+| Residual RMSNorm + input transform as a prologue of the next matmul | ~0.3-0.5 ms (-128 kernels) | GEMM blocks may only wait on lower block ids; needs a pending-norm hand-off with a flush for non-RDNA3 consumers of the norm output |
+| Per-layer megakernel including the EXL3 matmuls | up to ~1.5 ms | `exl3_rdna3_unit` is already a device function; needs its LDS in one union and 256- vs 128-thread stages reconciled, at the risk of slowing the matmuls |
 | Parallelize the RMSNorm input-transform tail | ~0.3 ms | `rms_norm_had` runs one block per row (8 blocks at 8 rows) and got ~2 us slower per call |
-| Fold `gated_delta_net_fused_op_3` into the conv / recurrence kernels | ~0.15 ms (-48 kernels) | compute beta / g in the recurrence, read the fp32 qkv directly in the conv update |
 | Attention: fuse RoPE + paged KV update + q/g deinterleave | ~0.1-0.15 ms (-32..48 kernels) | 16 attention layers |
 | RMSNorm input-transform hand-off for the attention qkv bundle | ~0.05 ms | the attention graph is still captured; the graph would need a variant without its input kernel |
 | Cheaper draft lm_head | up to ~1.3 ms | DFlash2 runs the full 6-bit lm_head (950 MB) over all 8 block rows every round; a pruned head lost acceptance, a dedicated small head would need training |

@@ -18,11 +18,13 @@ FLAGS = {
     "host":   dict(abl = True,  ps = True,  nb = True,  rc = True,  mk = False),
     "all":    dict(abl = True,  ps = True,  nb = True,  rc = True,  mk = True),
     "nomk":   dict(abl = True,  ps = True,  nb = True,  rc = True,  mk = False),
+    "all+act": dict(abl = True, ps = True,  nb = True,  rc = True,  mk = True, act = True),
 }
 from exllamav3.ext import exllamav3_ext as ext
 def setf(f):
     T._abl_fuse = f["abl"]; G._presample_enable = f["ps"]; G._draft_nb_enable = f["nb"]; GDN._rewind_cache_enable = f["rc"]
     if hasattr(ext, "gdn_mk_set"): ext.gdn_mk_set(1 if f["mk"] else 0)
+    if hasattr(ext, "act_epi_set"): ext.act_epi_set(1 if f.get("act") else 0)
 config = Config.from_directory(args.m); model = Model.from_config(config)
 dm = Model.from_config(Config.from_directory(args.dm))
 cache = Cache(model, max_num_tokens = 16384, max_history = 8, max_batch_size = 1); model.load(progressbar = False)

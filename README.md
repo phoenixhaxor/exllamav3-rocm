@@ -304,6 +304,7 @@ each graph launch adds ~8 us of GPU idle. Replacing the per-module graphs with e
 | Adaptive verification window (per-position acceptance EMA, window maximizing tokens / round time) | prose +4-5%, code -3%; kept off (`EXL3_ADAPT_WINDOW=1`) |
 | Continuous weight ring across x chunks + double-buffered x staging (one barrier per half chunk) | 3-bit +6%, 5-bit +4%, 4-bit +1% at 8 rows (more barriers, more VGPRs) |
 | CU mode (`-mcumode`), `amdgpu_waves_per_eu` 8-16 | CU mode +6%; waves-per-EU no effect |
+| Loader wave (warp specialization): a ninth wave per block streams the group's tiles into an LDS ring (and x into an LDS double buffer), compute waves read words from LDS and sync on progress counters | 4-bit 8 rows 85 -> 117 us, 1 row 57 -> 79 us at best. Release fences on the progress flags wait for all of the loader's loads (vmcnt(0)); with relaxed LDS flags, wide loads and cached polling one wave still streams slower than eight (68 us vs 61 us with no compute at all), and a deeper ring costs occupancy (LDS) |
 | Hardware counters (rocprofv3 from the ROCm 10 wheel) | the profiler aborts on gfx1100; component costs measured with the kbench switches instead |
 
 ### Memory bandwidth utilization
@@ -433,7 +434,7 @@ Estimated gains are per speculative round (~36 ms); each is small, which is why 
 |---|---|---|
 | Residual RMSNorm + input transform as a prologue of the next matmul | ~0.3-0.5 ms (-128 kernels) | GEMM blocks may only wait on lower block ids; needs a pending-norm hand-off with a flush for non-RDNA3 consumers of the norm output |
 | Lower-bit copy of lm_head for the draft only | up to ~0.8 ms | the draft needs only the top-k per row over the full vocabulary; a 3-bit head (~0.45 GB instead of 0.95 GB) keeps the ordering mostly; verification stays exact, the cost is some acceptance. Needs requantizing the head (ROCm quantization kernels untested) |
-| Better memory / compute overlap in the 8-row matmul | up to ~20% of the verification matmuls (~5 ms) at perfect overlap, realistically less | compute-only and memory-only are each ~56 us for the gate/up shape against 79 us combined (see "Why the 8-row kernel is not faster"); the next structural step would be loader waves streaming weights into LDS so compute waves never wait on memory, at the price of an LDS write + read per word (an LDS read costs about 2 VALU cycles here) |
+| Better memory / compute overlap in the 8-row matmul | up to ~20% of the verification matmuls (~5 ms) at perfect overlap | compute-only and memory-only are each ~56 us for the gate/up shape against 79 us combined (see "Why the 8-row kernel is not faster"); a loader-wave design lost (see the tried list). What remains is compute reduction: every VALU op per tile slice is worth ~0.7 us per 4-bit gate/up matmul |
 | 4-bit single-row path at ~790 GB/s | ~0.5 ms for plain decode only | the access pattern allows ~856 GB/s (`micro/stridebw.cc`) |
 | Per-layer megakernel including the EXL3 matmuls | up to ~1.5 ms | `exl3_rdna3_unit` is already a device function; needs its LDS in one union and 256- vs 128-thread stages reconciled, at the risk of slowing the matmuls |
 | Parallelize the RMSNorm input-transform tail | ~0.3 ms | `rms_norm_had` runs one block per row (8 blocks at 8 rows) and got ~2 us slower per call |

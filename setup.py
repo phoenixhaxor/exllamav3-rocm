@@ -47,6 +47,9 @@ if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
     extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
 
 if torch and torch_version.hip:
+    if not windows:
+        # Parse <chrono> before HIP's __noinline__ macro reaches GCC 16 <format>.
+        extra_cflags += ["-include", "chrono"]
     extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF", "-mno-wavefrontsize64"]
     _nvcc_only = {"--use_fast_math", "-Xcudafe", "--diag_suppress=177", "--diag_suppress=20012"}
     extra_cuda_cflags = [f for f in extra_cuda_cflags if f not in _nvcc_only]
